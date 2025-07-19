@@ -267,7 +267,6 @@ Host {self.config.ssh_host}
     
     # Compression and ciphers for speed
     Compression yes
-    CompressionLevel 6
     Cipher aes128-ctr
     
     # Disable unnecessary features for speed

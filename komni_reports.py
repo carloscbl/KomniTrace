@@ -56,6 +56,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Silence matplotlib debug logs (font matching, etc.)
+matplotlib_logger = logging.getLogger('matplotlib')
+matplotlib_logger.setLevel(logging.WARNING)
+
+# Also silence font manager specifically
+font_manager_logger = logging.getLogger('matplotlib.font_manager')
+font_manager_logger.setLevel(logging.WARNING)
+
 
 class KomniReportGenerator:
     """Main class for generating reports and visualizations from KomniTrace events"""
@@ -164,25 +172,16 @@ class KomniReportGenerator:
         """Generate a timeline graph using matplotlib (if available)"""
         if not MATPLOTLIB_AVAILABLE:
             logger.warning("matplotlib not available, skipping graph generation")
-            logger.info("To enable graph generation, install matplotlib: pip install matplotlib")
             return ""
         
         if not self.events:
             logger.warning("No events to plot")
             return ""
         
-        logger.info("Generating timeline graph")
-        
         # Group events by topic and event_type for better visualization
         topic_events = defaultdict(lambda: defaultdict(list))
         for event in self.events:
             topic_events[event.topic][event.event_type].append(event)
-        
-        # Debug: Print the grouping
-        logger.info("Event grouping by topic and event_type:")
-        for topic, event_types in topic_events.items():
-            for event_type, events in event_types.items():
-                logger.info(f"  {topic} -> {event_type}: {len(events)} events")
         
         # Create figure and axis with better size
         fig, ax = plt.subplots(figsize=(20, 12))
@@ -363,7 +362,6 @@ class KomniReportGenerator:
         plt.savefig(graph_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        logger.info(f"Timeline graph saved to: {graph_path}")
         return graph_path
     
     def generate_timeline_swimlane(self) -> str:
@@ -375,8 +373,6 @@ class KomniReportGenerator:
         if not self.events:
             logger.warning("No events to plot")
             return ""
-        
-        logger.info("Generating swimlane timeline visualization")
         
         # Group events by topic and event_type
         topic_events = defaultdict(lambda: defaultdict(list))
@@ -468,7 +464,6 @@ class KomniReportGenerator:
         plt.savefig(swimlane_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        logger.info(f"Swimlane timeline saved to: {swimlane_path}")
         return swimlane_path
     
     def generate_event_flow_diagram(self) -> str:
@@ -480,8 +475,6 @@ class KomniReportGenerator:
         if not self.events:
             logger.warning("No events to plot")
             return ""
-        
-        logger.info("Generating event flow diagram")
         
         # Sort events by timestamp
         sorted_events = sorted(self.events, key=lambda x: x.timestamp)
@@ -545,7 +538,6 @@ class KomniReportGenerator:
         plt.savefig(flow_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        logger.info(f"Event flow diagram saved to: {flow_path}")
         return flow_path
     
     def generate_compact_timeline(self) -> str:
@@ -557,8 +549,6 @@ class KomniReportGenerator:
         if not self.events:
             logger.warning("No events to plot")
             return ""
-        
-        logger.info("Generating compact timeline visualization")
         
         # Sort events by timestamp
         sorted_events = sorted(self.events, key=lambda x: x.timestamp)
@@ -633,7 +623,6 @@ class KomniReportGenerator:
         plt.savefig(compact_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        logger.info(f"Compact timeline saved to: {compact_path}")
         return compact_path
     
     def generate_html_report(self, graph_paths: dict) -> str:
@@ -641,8 +630,6 @@ class KomniReportGenerator:
         if not self.events:
             logger.warning("No events to generate HTML report")
             return ""
-        
-        logger.info("Generating interactive HTML report")
         
         # HTML template
         html_content = f"""
@@ -932,21 +919,17 @@ class KomniReportGenerator:
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
-        logger.info(f"Interactive HTML report saved to: {html_path}")
         return html_path
     
     def generate_plotly_interactive_timeline(self) -> str:
         """Generate an interactive timeline using Plotly - HIGHLY RECOMMENDED for dynamic control"""
         if not PLOTLY_AVAILABLE:
             logger.warning("plotly not available, skipping interactive timeline generation")
-            logger.info("To enable interactive visualizations, install plotly: pip install plotly")
             return ""
         
         if not self.events:
             logger.warning("No events to plot")
             return ""
-        
-        logger.info("Generating interactive Plotly timeline")
         
         # Sort events by timestamp
         sorted_events = sorted(self.events, key=lambda x: x.timestamp)
@@ -1078,7 +1061,6 @@ class KomniReportGenerator:
         plotly_path = os.path.join(self.config.output_dir, f"interactive_timeline_{self.config.device_id}.html")
         fig.write_html(plotly_path)
         
-        logger.info(f"Interactive Plotly timeline saved to: {plotly_path}")
         return plotly_path
     
     def save_events_to_json(self) -> str:
@@ -1100,5 +1082,4 @@ class KomniReportGenerator:
                 events_data.append(event_dict)
             json.dump(events_data, f, indent=2)
         
-        logger.info(f"Events saved to: {events_file}")
         return events_file

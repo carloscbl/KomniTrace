@@ -698,7 +698,7 @@ def _get_topic_end_offsets(topic: str, config: TraceConfig) -> Dict[int, int]:
         # Print the full command for debugging
         logger.info(f"Executing command to get offsets: {' '.join(cmd)}")
         
-        result = _execute_remote_command(config, cmd, timeout=30)
+        result = _execute_remote_command(config, cmd, timeout=45)  # Increased timeout from 30 to 45 seconds
 
         if result.returncode != 0:
             # Print full debug information
@@ -775,7 +775,7 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
             "--topic", topic,
             "--from-beginning",
             "--max-messages", "1",
-            "--timeout-ms", "5000"
+            "--timeout-ms", "8000"  # Increased timeout for slower networks
         ]
         test_cmd_str = " ".join(shlex.quote(c) for c in test_cmd)
         test_full_cmd = [
@@ -787,11 +787,16 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
         test_full_cmd.extend(["--", "sh", "-c", test_cmd_str])
         
         logger.info(f"Process {process_id} testing topic accessibility for {topic}")
-        test_result = _execute_remote_command(config, test_full_cmd, timeout=10)
-        if test_result.returncode != 0:
-            logger.warning(f"Process {process_id} topic test failed for {topic}: {test_result.stderr.strip()}")
-        else:
-            logger.info(f"Process {process_id} topic {topic} is accessible, found sample data: {'Yes' if test_result.stdout.strip() else 'No'}")
+        try:
+            test_result = _execute_remote_command(config, test_full_cmd, timeout=20)  # Increased SSH timeout
+            if test_result.returncode != 0:
+                logger.warning(f"Process {process_id} topic test failed for {topic}: {test_result.stderr.strip()}")
+            else:
+                logger.info(f"Process {process_id} topic {topic} is accessible, found sample data: {'Yes' if test_result.stdout.strip() else 'No'}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Process {process_id} topic accessibility test timed out for {topic} - continuing anyway")
+        except Exception as e:
+            logger.warning(f"Process {process_id} topic accessibility test failed for {topic}: {e} - continuing anyway")
         
         # 2. Build and execute the consumer command with optimized settings
         consumer_parts = [
@@ -816,7 +821,7 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
             consumer_parts.extend(["--max-messages", str(config.max_messages)])
         
         # Use timeout to force consumer termination after reasonable time
-        timeout_cmd = f"timeout {config.consumer_inactivity_timeout + 5}"
+        timeout_cmd = f"timeout {config.consumer_inactivity_timeout + 10}"  # Give more buffer time
         inner_cmd_str = timeout_cmd + " " + " ".join(shlex.quote(c) for c in consumer_parts)
         
         # Log the consumer command for debugging
@@ -836,170 +841,174 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
         start_time = time.time()
         last_activity_time = start_time
 
-        with _execute_remote_popen(config, cmd) as proc:
-            if proc.stdout is None:
-                stderr_text = proc.stderr.read() if proc.stderr else "N/A"
-                logger.error(f"Process {process_id} failed to start consumer for topic {topic}. Stderr: {stderr_text.strip()}")
-                with open(output_file, 'wb') as f: f.write(orjson.dumps([]));
-                return output_file
+        try:
+            with _execute_remote_popen(config, cmd) as proc:
+                if proc.stdout is None:
+                    stderr_text = proc.stderr.read() if proc.stderr else "N/A"
+                    logger.error(f"Process {process_id} failed to start consumer for topic {topic}. Stderr: {stderr_text.strip()}")
+                    with open(output_file, 'wb') as f: f.write(orjson.dumps([]));
+                    return output_file
 
-            # 3. Read output with simplified approach
-            messages_processed = 0
-            start_time = time.time()
-            all_messages = []  # Store all messages for debugging
-            
-            logger.info(f"Process {process_id} starting to read messages from topic {topic}")
-            
-            try:
-                for line in proc.stdout:
-                    if not line.strip():
-                        continue
-
-                    messages_processed += 1
-                    
-                    # Log progress more frequently at the beginning
-                    if messages_processed <= 10 or messages_processed % 50 == 0:
-                        logger.info(f"Process {process_id} processed {messages_processed} messages from {topic}")
-
-                    # First, store the raw line for debugging - ALWAYS
-                    raw_debug_info = {
-                        "message_number": messages_processed,
-                        "raw_line": line.strip()
-                    }
-                    all_messages.append(raw_debug_info)
-                    
-                    try:
-                        # Parse line: CreateTime:ts\tmessage (simplified format)
-                        parts = line.strip().split('\t', 1)
-                        if len(parts) < 2: 
-                            # Update the debug info to show why it was skipped
-                            raw_debug_info["skip_reason"] = "Less than 2 parts after tab split"
-                            raw_debug_info["parts_count"] = len(parts)
+                # 3. Read output with simplified approach
+                messages_processed = 0
+                start_time = time.time()
+                all_messages = []  # Store all messages for debugging
+                
+                logger.info(f"Process {process_id} starting to read messages from topic {topic}")
+                
+                try:
+                    for line in proc.stdout:
+                        if not line.strip():
                             continue
-                        
-                        metadata, message = parts
-                        timestamp_str = None
-                        
-                        # Parse metadata - look for timestamp
-                        for part in metadata.split():
-                            if part.startswith('CreateTime:'): 
-                                timestamp_str = part.split(':', 1)[1]
-                                break
-                        
-                        # If no timestamp in metadata, maybe the whole metadata IS the timestamp
-                        if not timestamp_str and metadata.isdigit():
-                            timestamp_str = metadata
 
-                        # We need at least timestamp to proceed
-                        if not timestamp_str: 
-                            # Update the debug info to show parsing details
-                            raw_debug_info["skip_reason"] = "Missing timestamp"
-                            raw_debug_info["metadata"] = metadata
-                            continue
+                        messages_processed += 1
                         
-                        event_timestamp = datetime.fromtimestamp(int(timestamp_str) / 1000)
-                        # Use default values for partition and offset since we're not printing them
-                        partition = 0
-                        offset = messages_processed  # Use message number as offset
+                        # Log progress more frequently at the beginning
+                        if messages_processed <= 10 or messages_processed % 50 == 0:
+                            logger.info(f"Process {process_id} processed {messages_processed} messages from {topic}")
 
-                        # Update debug info with parsed data
-                        raw_debug_info.update({
-                            "timestamp": event_timestamp.isoformat(),
-                            "partition": partition,
-                            "offset": offset,
-                            "raw_message": message,
-                            "metadata": metadata,
-                            "parsed_successfully": True
-                        })
-
-                        # Time filtering
-                        if config.max_age_hours > 0:
-                            cutoff_time = datetime.now() - timedelta(hours=config.max_age_hours)
-                            if event_timestamp < cutoff_time:
-                                raw_debug_info["skip_reason"] = "Message too old"
-                                raw_debug_info["cutoff_time"] = cutoff_time.isoformat()
-                                continue
+                        # First, store the raw line for debugging - ALWAYS
+                        raw_debug_info = {
+                            "message_number": messages_processed,
+                            "raw_line": line.strip()
+                        }
+                        all_messages.append(raw_debug_info)
                         
-                        # Parse JSON and create event
                         try:
-                            json_data = orjson.loads(message)
-                            raw_debug_info["json_parsed"] = True
-                        except orjson.JSONDecodeError as e:
-                            json_data = {"raw_message": message}
-                            raw_debug_info["json_parsed"] = False
-                            raw_debug_info["json_error"] = str(e)
+                            # Parse line: CreateTime:ts\tmessage (simplified format)
+                            parts = line.strip().split('\t', 1)
+                            if len(parts) < 2: 
+                                # Update the debug info to show why it was skipped
+                                raw_debug_info["skip_reason"] = "Less than 2 parts after tab split"
+                                raw_debug_info["parts_count"] = len(parts)
+                                continue
+                            
+                            metadata, message = parts
+                            timestamp_str = None
+                            
+                            # Parse metadata - look for timestamp
+                            for part in metadata.split():
+                                if part.startswith('CreateTime:'): 
+                                    timestamp_str = part.split(':', 1)[1]
+                                    break
+                            
+                            # If no timestamp in metadata, maybe the whole metadata IS the timestamp
+                            if not timestamp_str and metadata.isdigit():
+                                timestamp_str = metadata
 
-                        # Debug: Log a few sample messages to see the structure
-                        if messages_processed <= 5:
-                            logger.info(f"Process {process_id} sample message {messages_processed}: {message[:200]}...")
+                            # We need at least timestamp to proceed
+                            if not timestamp_str: 
+                                # Update the debug info to show parsing details
+                                raw_debug_info["skip_reason"] = "Missing timestamp"
+                                raw_debug_info["metadata"] = metadata
+                                continue
+                            
+                            event_timestamp = datetime.fromtimestamp(int(timestamp_str) / 1000)
+                            # Use default values for partition and offset since we're not printing them
+                            partition = 0
+                            offset = messages_processed  # Use message number as offset
 
-                        # Since we're not tracking real partitions/offsets, use a simpler termination logic
-                        # We'll rely on the timeout mechanism instead of offset tracking
-                        
-                        # Check if message contains our device_id
-                        contains_device = _contains_device_id(json_data, config.device_id)
-                        raw_debug_info["contains_device_id"] = contains_device
-                        
-                        # Only save events that contain our device_id
-                        if contains_device:
-                            event = {
-                                "timestamp": event_timestamp.isoformat(), "topic": topic,
-                                "device_id": config.device_id, "event_type": _extract_event_type(json_data),
-                                "message": message, "raw_data": json_data,
-                                "partition": partition, "offset": offset
-                            }
-                            events_found.append(event)
-                            raw_debug_info["event_saved"] = True
-                            logger.info(f"Process {process_id} found event in {topic}:{partition}@{offset}")
-                        else:
-                            raw_debug_info["event_saved"] = False
-                            # Debug: Log why message was filtered out (only for first few messages)
-                            if messages_processed <= 3:
-                                logger.info(f"Process {process_id} message {messages_processed} does not contain device_id '{config.device_id}'")
+                            # Update debug info with parsed data
+                            raw_debug_info.update({
+                                "timestamp": event_timestamp.isoformat(),
+                                "partition": partition,
+                                "offset": offset,
+                                "raw_message": message,
+                                "metadata": metadata,
+                                "parsed_successfully": True
+                            })
 
-                        # For now, let the timeout handle termination since we don't have reliable partition/offset info
-                        # Check if all partitions are finished
-                        # if all(partitions_finished.values()):
-                        #     logger.info(f"Process {process_id}: All target offsets reached for topic {topic}. Terminating consumer after {messages_processed} messages.")
-                        #     break
+                            # Time filtering
+                            if config.max_age_hours > 0:
+                                cutoff_time = datetime.now() - timedelta(hours=config.max_age_hours)
+                                if event_timestamp < cutoff_time:
+                                    raw_debug_info["skip_reason"] = "Message too old"
+                                    raw_debug_info["cutoff_time"] = cutoff_time.isoformat()
+                                    continue
+                            
+                            # Parse JSON and create event
+                            try:
+                                json_data = orjson.loads(message)
+                                raw_debug_info["json_parsed"] = True
+                            except orjson.JSONDecodeError as e:
+                                json_data = {"raw_message": message}
+                                raw_debug_info["json_parsed"] = False
+                                raw_debug_info["json_error"] = str(e)
 
-                    except Exception as e:
-                        logger.error(f"Process {process_id} error parsing line from topic {topic}: {e}")
-                        # Update debug info with error details
-                        if 'raw_debug_info' in locals():
-                            raw_debug_info["parsing_error"] = str(e)
-                            raw_debug_info["parsing_error_type"] = type(e).__name__
-                        continue
+                            # Debug: Log a few sample messages to see the structure
+                            if messages_processed <= 5:
+                                logger.info(f"Process {process_id} sample message {messages_processed}: {message[:200]}...")
 
-            except Exception as e:
-                logger.error(f"Process {process_id} error reading from stdout: {e}")
-            
-            # Save ALL messages to debug file (optional, can be enabled for debugging)
-            if False:  # Set to True to enable debug file generation
-                os.makedirs(config.output_dir, exist_ok=True)
-                debug_file = os.path.join(config.output_dir, f"debug_all_messages_{topic}_{process_id}.json")
-                try:
-                    with open(debug_file, 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(all_messages, indent=2))
-                    logger.info(f"Process {process_id} saved all {len(all_messages)} messages to debug file: {debug_file}")
+                            # Since we're not tracking real partitions/offsets, use a simpler termination logic
+                            # We'll rely on the timeout mechanism instead of offset tracking
+                            
+                            # Check if message contains our device_id
+                            contains_device = _contains_device_id(json_data, config.device_id)
+                            raw_debug_info["contains_device_id"] = contains_device
+                            
+                            # Only save events that contain our device_id
+                            if contains_device:
+                                event = {
+                                    "timestamp": event_timestamp.isoformat(), "topic": topic,
+                                    "device_id": config.device_id, "event_type": _extract_event_type(json_data),
+                                    "message": message, "raw_data": json_data,
+                                    "partition": partition, "offset": offset
+                                }
+                                events_found.append(event)
+                                raw_debug_info["event_saved"] = True
+                                logger.info(f"Process {process_id} found event in {topic}:{partition}@{offset}")
+                            else:
+                                raw_debug_info["event_saved"] = False
+                                # Debug: Log why message was filtered out (only for first few messages)
+                                if messages_processed <= 3:
+                                    logger.info(f"Process {process_id} message {messages_processed} does not contain device_id '{config.device_id}'")
+
+                            # For now, let the timeout handle termination since we don't have reliable partition/offset info
+                            # Check if all partitions are finished
+                            # if all(partitions_finished.values()):
+                            #     logger.info(f"Process {process_id}: All target offsets reached for topic {topic}. Terminating consumer after {messages_processed} messages.")
+                            #     break
+
+                        except Exception as e:
+                            logger.error(f"Process {process_id} error parsing line from topic {topic}: {e}")
+                            # Update debug info with error details
+                            if 'raw_debug_info' in locals():
+                                raw_debug_info["parsing_error"] = str(e)
+                                raw_debug_info["parsing_error_type"] = type(e).__name__
+                            continue
+
                 except Exception as e:
-                    logger.error(f"Process {process_id} failed to save debug file: {e}")
-            
-            logger.info(f"Process {process_id} finished reading {messages_processed} total messages from topic {topic}")
-            
-            # Safety check: if we haven't finished all partitions, log it
-            if not all(partitions_finished.values()):
-                unfinished = [p for p, finished in partitions_finished.items() if not finished]
-                logger.warning(f"Process {process_id} for topic {topic} finished but partitions {unfinished} were not completed. This is normal if those partitions don't have enough messages.")
+                    logger.error(f"Process {process_id} error reading from stdout: {e}")
+                
+                # Save ALL messages to debug file (optional, can be enabled for debugging)
+                if False:  # Set to True to enable debug file generation
+                    os.makedirs(config.output_dir, exist_ok=True)
+                    debug_file = os.path.join(config.output_dir, f"debug_all_messages_{topic}_{process_id}.json")
+                    try:
+                        with open(debug_file, 'w', encoding='utf-8') as f:
+                            f.write(json.dumps(all_messages, indent=2))
+                        logger.info(f"Process {process_id} saved all {len(all_messages)} messages to debug file: {debug_file}")
+                    except Exception as e:
+                        logger.error(f"Process {process_id} failed to save debug file: {e}")
+                
+                logger.info(f"Process {process_id} finished reading {messages_processed} total messages from topic {topic}")
+                
+                # Safety check: if we haven't finished all partitions, log it
+                if not all(partitions_finished.values()):
+                    unfinished = [p for p, finished in partitions_finished.items() if not finished]
+                    logger.warning(f"Process {process_id} for topic {topic} finished but partitions {unfinished} were not completed. This is normal if those partitions don't have enough messages.")
 
-            # Terminate the process gracefully
-            if proc.poll() is None:  # If still running
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"Process {process_id} for topic {topic} did not terminate gracefully, killing.")
-                    proc.kill()
+                # Terminate the process gracefully
+                if proc.poll() is None:  # If still running
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Process {process_id} for topic {topic} did not terminate gracefully, killing.")
+                        proc.kill()
+
+        except Exception as e:
+            logger.error(f"Process {process_id} encountered error in main consumer block for topic {topic}: {e}", exc_info=True)
 
 
         total_elapsed = time.time() - start_time
@@ -1161,8 +1170,8 @@ class KomniTracer:
             ])
             
             logger.info("Executing topic discovery command...")
-            # Use shorter timeout for topic discovery
-            result = _execute_remote_command(self.config, cmd, timeout=30)
+            # Increased timeout for topic discovery in slower networks
+            result = _execute_remote_command(self.config, cmd, timeout=45)
             
             if result.returncode != 0:
                 logger.error(f"Failed to list Kafka topics (return code: {result.returncode})")

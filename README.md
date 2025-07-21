@@ -120,7 +120,7 @@ python3 KomniTrace.py \
 python3 KomniTrace.py \
   --namespace my-namespace \
   --device-id "device123" \
-  --topics as-provision-topic device-events-topic audit-topic
+  --topics crud-topic device-events-topic audit-topic
 ```
 
 #### 5. Limited Time Range

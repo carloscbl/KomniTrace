@@ -21,8 +21,6 @@ Usage:
 
 import os
 import os.path
-import orjson
-import json
 import logging
 import argparse
 import shutil
@@ -33,6 +31,22 @@ from typing import List, Optional, Dict, Any, Tuple
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
+
+# Try to import orjson, fallback to standard json
+try:
+    import orjson
+    JSON_LOADS = orjson.loads
+    JSON_DUMPS = lambda obj: orjson.dumps(obj).decode('utf-8')
+    JSON_DUMPS_BYTES = orjson.dumps
+    JSON_DECODE_ERROR = orjson.JSONDecodeError
+    print("INFO: Using orjson for faster JSON processing")
+except ImportError:
+    import json
+    JSON_LOADS = json.loads
+    JSON_DUMPS = lambda obj: json.dumps(obj)
+    JSON_DUMPS_BYTES = lambda obj: json.dumps(obj).encode('utf-8')
+    JSON_DECODE_ERROR = json.JSONDecodeError
+    print("WARNING: orjson not available, using standard json library (slower performance)")
 import random
 import uuid
 import shlex
@@ -514,7 +528,7 @@ class TraceConfig:
 def _contains_device_id(data: Dict[str, Any], device_id: str) -> bool:
     """Check if the JSON data contains the target device_id anywhere in the text"""
     try:
-        json_text = orjson.dumps(data).decode('utf-8')
+        json_text = JSON_DUMPS(data)
         device_id_lower = device_id.lower()
         json_text_lower = json_text.lower()
         result = device_id_lower in json_text_lower
@@ -764,7 +778,7 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
         if not partitions_to_check:
             logger.info(f"Process {process_id}: Topic {topic} is empty or has no messages. Skipping consumption.")
             with open(output_file, 'wb') as f:
-                f.write(orjson.dumps([]))
+                f.write(JSON_DUMPS_BYTES([]))
             return output_file
         
         # Quick test: get a sample message to verify topic accessibility
@@ -846,7 +860,7 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
                 if proc.stdout is None:
                     stderr_text = proc.stderr.read() if proc.stderr else "N/A"
                     logger.error(f"Process {process_id} failed to start consumer for topic {topic}. Stderr: {stderr_text.strip()}")
-                    with open(output_file, 'wb') as f: f.write(orjson.dumps([]));
+                    with open(output_file, 'wb') as f: f.write(JSON_DUMPS_BYTES([]));
                     return output_file
 
                 # 3. Read output with simplified approach
@@ -928,9 +942,9 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
                             
                             # Parse JSON and create event
                             try:
-                                json_data = orjson.loads(message)
+                                json_data = JSON_LOADS(message)
                                 raw_debug_info["json_parsed"] = True
-                            except orjson.JSONDecodeError as e:
+                            except JSON_DECODE_ERROR as e:
                                 json_data = {"raw_message": message}
                                 raw_debug_info["json_parsed"] = False
                                 raw_debug_info["json_error"] = str(e)
@@ -1015,13 +1029,13 @@ def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str
         logger.info(f"Process {process_id} completed for topic {topic}. Found {len(events_found)} events in {total_elapsed:.2f}s.")
 
         with open(output_file, 'wb') as f:
-            f.write(orjson.dumps(events_found))
+            f.write(JSON_DUMPS_BYTES(events_found))
         return output_file
 
     except Exception as e:
         logger.error(f"Process {process_id} encountered a fatal error for topic {topic}: {e}", exc_info=True)
         with open(output_file, 'wb') as f:
-            f.write(orjson.dumps([]))
+            f.write(JSON_DUMPS_BYTES([]))
         return output_file
 
 
@@ -1243,7 +1257,7 @@ class KomniTracer:
         """Load events from a JSON file created by a worker process"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                events_data = orjson.loads(f.read())
+                events_data = JSON_LOADS(f.read())
             
             return [KafkaEvent(
                 timestamp=datetime.fromisoformat(e['timestamp']),
@@ -1255,6 +1269,128 @@ class KomniTracer:
         except Exception as e:
             logger.error(f"Error loading events from {file_path}: {e}")
             return []
+
+
+def load_events_from_json(json_file: str) -> List[KafkaEvent]:
+    """Load events from a JSON file and convert them to KafkaEvent objects"""
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            events_data = JSON_LOADS(f.read())
+        
+        events = []
+        for e in events_data:
+            event = KafkaEvent(
+                timestamp=datetime.fromisoformat(e['timestamp']),
+                topic=e['topic'],
+                device_id=e['device_id'],
+                event_type=e['event_type'],
+                message=e['message'],
+                raw_data=e['raw_data'],
+                partition=e.get('partition'),
+                offset=e.get('offset')
+            )
+            events.append(event)
+        
+        logger.info(f"Loaded {len(events)} events from {json_file}")
+        return events
+    except Exception as e:
+        logger.error(f"Error loading events from {json_file}: {e}")
+        return []
+
+
+def generate_report_only(json_file: str, device_id: str, output_dir: str = "./trace_output"):
+    """Generate only the report from an existing events JSON file"""
+    logger.info(f"Report-only mode: Loading events from {json_file}")
+    
+    # Load events from JSON file
+    events = load_events_from_json(json_file)
+    
+    if not events:
+        logger.error("No events loaded from JSON file")
+        return
+    
+    # Create a minimal config for report generation
+    config = TraceConfig(
+        namespace="report-only",
+        device_id=device_id,
+        kafka_broker="localhost:9092",  # Not used in report-only mode
+        output_dir=output_dir
+    )
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    logger.info(f"Generating report for {len(events)} events")
+    
+    # Generate report
+    report_path = ""
+    if KomniReportGenerator:
+        logger.info("Generating visualizations and HTML report...")
+        report_generator = KomniReportGenerator(events, config)
+        
+        # Generate all graph types and collect their paths
+        graph_paths = {}
+        
+        try:
+            # Generate timeline graph
+            timeline_path = report_generator.generate_timeline_graph()
+            if timeline_path:
+                graph_paths['timeline'] = timeline_path
+                logger.info(f"Generated timeline graph: {timeline_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate timeline graph: {e}")
+        
+        try:
+            # Generate swimlane timeline
+            swimlane_path = report_generator.generate_timeline_swimlane()
+            if swimlane_path:
+                graph_paths['swimlane'] = swimlane_path
+                logger.info(f"Generated swimlane timeline: {swimlane_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate swimlane timeline: {e}")
+        
+        try:
+            # Generate event flow diagram
+            flow_path = report_generator.generate_event_flow_diagram()
+            if flow_path:
+                graph_paths['flow'] = flow_path
+                logger.info(f"Generated flow diagram: {flow_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate flow diagram: {e}")
+        
+        try:
+            # Generate compact timeline
+            compact_path = report_generator.generate_compact_timeline()
+            if compact_path:
+                graph_paths['compact'] = compact_path
+                logger.info(f"Generated compact timeline: {compact_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate compact timeline: {e}")
+        
+        # Generate HTML report with all the graph paths
+        try:
+            report_path = report_generator.generate_html_report(graph_paths)
+            logger.info(f"Generated HTML report with {len(graph_paths)} visualizations")
+        except Exception as e:
+            logger.error(f"Failed to generate HTML report: {e}")
+        
+        # Optionally generate interactive Plotly timeline if available
+        try:
+            plotly_path = report_generator.generate_plotly_interactive_timeline()
+            if plotly_path:
+                logger.info(f"Generated interactive Plotly timeline: {plotly_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate interactive Plotly timeline: {e}")
+    else:
+        logger.error("KomniReportGenerator not available. Cannot generate reports.")
+        return
+    
+    print("\n" + "="*60)
+    print("🎉 Report generation completed successfully!")
+    print(f"📊 Processed {len(events)} events for device {device_id}")
+    print(f"📁 Report saved to: {output_dir}")
+    if report_path:
+        print(f"  📄 HTML Report: {report_path}")
+    print("="*60)
 
 
 def main():
@@ -1270,6 +1406,12 @@ Examples:
   # Process only specific topics (much faster)
   python KomniTrace.py --namespace my-namespace --device-id "12345" \\
     --topics as-provision-topic device-events-topic audit-topic
+  
+  # Generate report from existing events JSON file (report-only mode)
+  python KomniTrace.py --report-only --events-json events_12345.json --device-id "12345"
+  
+  # Collect events data only, skip report generation (faster)
+  python KomniTrace.py --namespace my-namespace --device-id "12345" --no-reports
   
   # Remote execution via SSH with automatic key setup
   python KomniTrace.py --namespace my-namespace --device-id "12345" \\
@@ -1298,8 +1440,14 @@ SSH Performance Features:
         """
     )
     
-    parser.add_argument('--namespace', '-n', required=True, help='Kubernetes namespace where Kafka is running')
+    # Report-only mode arguments
+    parser.add_argument('--report-only', action='store_true', 
+                       help='Generate report from existing events JSON file (skips Kafka consumption)')
+    parser.add_argument('--events-json', 
+                       help='Path to existing events JSON file (required for --report-only)')
+    
     parser.add_argument('--device-id', '-d', required=True, help='Device ID to search for in Kafka events')
+    parser.add_argument('--namespace', '-n', help='Kubernetes namespace where Kafka is running (not required for --report-only)')
     parser.add_argument('--kafka-broker', '-b', default='kafka:9092', help='Kafka broker address (default: kafka:9092)')
     parser.add_argument('--max-age', '-a', type=int, default=24 * 8, help='Maximum age of events in hours (default: 192, 0 = all history)')
     parser.add_argument('--max-parallel', '-p', type=int, default=4, help='Maximum parallel topic consumers')
@@ -1320,10 +1468,25 @@ SSH Performance Features:
     parser.add_argument('--kafka-pod', default='deployment/kafka', help='Kafka pod selector (default: deployment/kafka)')
     parser.add_argument('--kafka-container', help='Kafka container name (if multiple containers in pod)')
     
-    parser.add_argument('--no-graphs', action='store_true', help='Skip graph generation')
+    parser.add_argument('--no-graphs', action='store_true', help='Skip graph generation (deprecated, use --no-reports)')
+    parser.add_argument('--no-reports', action='store_true', help='Skip report and graph generation, only save events JSON')
     parser.add_argument('--skip-offsets', action='store_true', help='Skip offset checking (faster but less precise termination)')
     
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.report_only:
+        if not args.events_json:
+            parser.error("--events-json is required when using --report-only")
+        if not os.path.exists(args.events_json):
+            parser.error(f"Events JSON file not found: {args.events_json}")
+        
+        # Run in report-only mode
+        generate_report_only(args.events_json, args.device_id, args.output_dir)
+        return
+    else:
+        if not args.namespace:
+            parser.error("--namespace is required when not using --report-only")
     
     config = TraceConfig(
         namespace=args.namespace, device_id=args.device_id,
@@ -1351,7 +1514,10 @@ SSH Performance Features:
             
             # --- Report Generation ---
             report_path = ""
-            if not args.no_graphs and KomniReportGenerator:
+            # Support both --no-graphs (deprecated) and --no-reports
+            skip_reports = args.no_reports or args.no_graphs
+            
+            if not skip_reports and KomniReportGenerator:
                 logger.info("Generating visualizations and HTML report...")
                 report_generator = KomniReportGenerator(events, config)
                 
@@ -1411,8 +1577,22 @@ SSH Performance Features:
             
             events_file = os.path.join(config.output_dir, f"events_{config.device_id}.json")
             with open(events_file, 'w', encoding='utf-8') as f:
-                # Usar orjson para un volcado rápido
-                events_data = [orjson.loads(orjson.dumps(e, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))) for e in tracer.events]
+                # Convert events to JSON serializable format
+                events_data = []
+                for e in tracer.events:
+                    event_dict = {
+                        'timestamp': e.timestamp.isoformat(),
+                        'topic': e.topic,
+                        'device_id': e.device_id,
+                        'event_type': e.event_type,
+                        'message': e.message,
+                        'raw_data': e.raw_data,
+                        'partition': e.partition,
+                        'offset': e.offset
+                    }
+                    events_data.append(event_dict)
+                
+                import json
                 f.write(json.dumps(events_data, indent=2))
             
             logger.info(f"Events saved to: {events_file}")
@@ -1424,6 +1604,8 @@ SSH Performance Features:
             print(f"  📋 Events JSON: {events_file}")
             if report_path:
                 print(f"  📄 HTML Report: {report_path}")
+            elif skip_reports:
+                print("  📄 HTML Report: Skipped (--no-reports or --no-graphs specified)")
             print("="*60)
             
     except KeyboardInterrupt:

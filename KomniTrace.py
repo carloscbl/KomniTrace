@@ -2,490 +2,110 @@
 """
 KomniTrace: Kubernetes Kafka Event Tracer
 
-A sophisticated tool for tracing device events across Kafka topics in Kubernetes environments.
-Provides comprehensive event collection, analysis, and visualization capabilities.
+Traces every Kafka record that mentions a device (or any other identifier)
+across the topics of a Kafka cluster running in Kubernetes, and renders the
+result as JSON + HTML reports.
 
-Features:
-- Parallel topic processing for optimal performance
-- **Smart-stop consumer**: Stops consuming precisely when all historical messages are read.
-- Non-linear time mapping for better visualization
-- Multiple visualization formats (timeline, swimlane, flow, compact)
-- Interactive Plotly charts (when available)
-- HTML report generation
-- SSH-based remote execution
-- Intelligent time filtering and topic discovery
+Collection model (production-safe by design):
+- Offsets for ALL topics are resolved with a handful of JVM launches
+  (earliest / latest / window start / window end) instead of one per topic.
+- The time window is translated to per-partition start offsets with
+  offsetsForTimes, so only the requested window is read from the brokers
+  (old segments outside the window are never touched).
+- Each partition is read with an exact, bounded consumer
+  (--partition/--offset/--max-messages + inactivity guard + hard timeout):
+  no consumer groups, no rebalances, no commits, no live tailing, and every
+  in-pod process terminates by itself even if the client disappears.
+- Filtering happens inside the pod (grep -F) so only matching records travel
+  through kubectl exec / SSH.
+- Tool JVMs run with a small heap, SerialGC, nice, and JMX/javaagents stripped;
+  pod memory headroom is checked before choosing the parallelism.
+- Per-partition coverage (expected vs consumed messages) is reported, so gaps
+  in what was actually read are visible instead of silent.
 
 Usage:
     python KomniTrace.py --namespace my-namespace --device-id "12345"
 """
 
-import os
-import os.path
-import logging
 import argparse
+import json
+import logging
+import os
+import re
+import shlex
 import shutil
-import tempfile
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
+import signal
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
+import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# Try to import orjson, fallback to standard json
 try:
     import orjson
     JSON_LOADS = orjson.loads
-    JSON_DUMPS = lambda obj: orjson.dumps(obj).decode('utf-8')
-    JSON_DUMPS_BYTES = orjson.dumps
     JSON_DECODE_ERROR = orjson.JSONDecodeError
-    print("INFO: Using orjson for faster JSON processing")
 except ImportError:
-    import json
     JSON_LOADS = json.loads
-    JSON_DUMPS = lambda obj: json.dumps(obj)
-    JSON_DUMPS_BYTES = lambda obj: json.dumps(obj).encode('utf-8')
     JSON_DECODE_ERROR = json.JSONDecodeError
-    print("WARNING: orjson not available, using standard json library (slower performance)")
-import random
-import uuid
-import shlex
-import select
-import sys
-import stat
-from pathlib import Path
 
-# Asumimos que komni_reports.py existe en el mismo directorio
-# Si no, necesitarás crearlo o comentar las líneas que lo usan.
 try:
     from komni_reports import KomniReportGenerator
 except ImportError:
     KomniReportGenerator = None
-    print("WARNING: komni_reports.py not found. Report generation will be disabled.")
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Changed back to INFO
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('komni_trace.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("komnitrace")
 
-
-class SSHKeyManager:
-    """Manages SSH key generation and setup for improved performance"""
-    
-    def __init__(self, config: 'TraceConfig'):
-        self.config = config
-        self.ssh_dir = Path.home() / '.ssh'
-        self.key_name = f"komni_trace_{config.ssh_host.replace('.', '_')}"
-        self.private_key_path = self.ssh_dir / self.key_name
-        self.public_key_path = self.ssh_dir / f"{self.key_name}.pub"
-        self.config_path = self.ssh_dir / 'config'
-        
-    def ensure_ssh_dir(self):
-        """Ensure SSH directory exists with proper permissions"""
-        self.ssh_dir.mkdir(mode=0o700, exist_ok=True)
-        
-    def generate_ssh_key(self) -> bool:
-        """Generate SSH key pair if it doesn't exist"""
-        try:
-            if self.private_key_path.exists():
-                logger.info(f"SSH key already exists: {self.private_key_path}")
-                return True
-                
-            logger.info(f"Generating SSH key pair for {self.config.ssh_host}...")
-            
-            # Generate SSH key pair
-            cmd = [
-                'ssh-keygen',
-                '-t', 'rsa',
-                '-b', '4096',
-                '-f', str(self.private_key_path),
-                '-N', '',  # No passphrase
-                '-C', f'komni_trace_{self.config.ssh_host}_{int(time.time())}'
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                logger.error(f"Failed to generate SSH key: {result.stderr}")
-                return False
-                
-            # Set proper permissions
-            self.private_key_path.chmod(0o600)
-            self.public_key_path.chmod(0o644)
-            
-            logger.info(f"SSH key pair generated successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error generating SSH key: {e}")
-            return False
-    
-    def copy_public_key_to_remote(self) -> bool:
-        """Copy public key to remote host using password authentication"""
-        try:
-            if not self.public_key_path.exists():
-                logger.error("Public key does not exist")
-                return False
-                
-            logger.info(f"Installing public key on {self.config.ssh_host}...")
-            
-            # Read public key
-            public_key = self.public_key_path.read_text().strip()
-            
-            # Use ssh-copy-id if available, with optimized settings
-            try:
-                cmd = [
-                    'sshpass', '-p', self.config.ssh_password,
-                    'ssh-copy-id',
-                    '-o', 'StrictHostKeyChecking=no',
-                    '-o', 'UserKnownHostsFile=/dev/null',
-                    '-o', 'ConnectTimeout=10',
-                    '-o', 'PreferredAuthentications=password',  # Only use password
-                    '-o', 'PubkeyAuthentication=no',  # Disable key auth attempts
-                    '-o', 'IdentitiesOnly=yes',  # Don't try default keys
-                    '-o', 'NumberOfPasswordPrompts=1',  # Only one password attempt
-                    '-i', str(self.public_key_path),
-                    f"{self.config.ssh_user}@{self.config.ssh_host}"
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if result.returncode == 0:
-                    logger.info("Public key installed successfully using ssh-copy-id")
-                    return True
-                else:
-                    logger.warning(f"ssh-copy-id failed: {result.stderr.strip()}")
-                    
-            except FileNotFoundError:
-                logger.info("ssh-copy-id not available, using manual approach")
-            
-            # Manual approach with optimized SSH settings
-            logger.info("Using manual approach to install public key...")
-            
-            # Create the complete command in one SSH session to minimize connection attempts
-            complete_setup_cmd = f'''
-set -e
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-touch ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-# Check if key already exists to avoid duplicates
-if ! grep -Fxq "{public_key}" ~/.ssh/authorized_keys 2>/dev/null; then
-    echo "{public_key}" >> ~/.ssh/authorized_keys
-    echo "Key added successfully"
-else
-    echo "Key already exists"
-fi
+# Field separator for kafka-console-consumer output (applies between every printed column)
+FIELD_SEP = "|KT|"
+# Marker lines emitted by the in-pod scripts
+MARK = "KTMARK|"
+TS_RE = re.compile(r'^(CreateTime|LogAppendTime):(-?\d+)$')
+OFFSET_LINE_RE = re.compile(r'^([A-Za-z0-9._-]+):(\d+):(-?\d*)$')
+PROCESSED_RE = re.compile(r'Processed a total of (\d+) messages')
+OFFSET_COL_RE = re.compile(r'\|KT\|Offset:(\d+)\|KT\|')
+AWK_FILTER = r'''awk 'BEGIN { n = split(tolower(ENVIRON["KT_TERMS"]), T, "\n") }
+/^KTMARK[|]p[|]/ { if (last != "") print "KTMARK|last|" cur "|" last; cur = substr($0, 10); last = ""; next }
+{ if (match($0, /[|]KT[|]Offset:[0-9]+[|]KT[|]/)) last = substr($0, RSTART + 11, RLENGTH - 15)
+  l = tolower($0); for (i = 1; i <= n; i++) if (index(l, T[i])) { print "KTMARK|p|" cur; print; break } }
+END { if (last != "") print "KTMARK|last|" cur "|" last }'
 '''
-            
-            cmd = [
-                'sshpass', '-p', self.config.ssh_password,
-                'ssh',
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'UserKnownHostsFile=/dev/null',
-                '-o', 'ConnectTimeout=10',
-                '-o', 'PreferredAuthentications=password',  # Only use password
-                '-o', 'PubkeyAuthentication=no',  # Disable key auth attempts
-                '-o', 'IdentitiesOnly=yes',  # Don't try default keys
-                '-o', 'NumberOfPasswordPrompts=1',  # Only one password attempt
-                '-o', 'LogLevel=ERROR',  # Reduce verbose output
-                f"{self.config.ssh_user}@{self.config.ssh_host}",
-                complete_setup_cmd
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-            if result.returncode == 0:
-                logger.info("Public key installed successfully using manual approach")
-                logger.debug(f"Setup output: {result.stdout.strip()}")
-                return True
-            else:
-                logger.error(f"Failed to install public key manually: {result.stderr.strip()}")
-                # Check if it's an authentication issue vs a server message
-                if "Too many authentication failures" in result.stderr:
-                    logger.error("Server is rejecting connections due to too many auth attempts")
-                    logger.error("Try waiting a few minutes before retrying, or check SSH server settings")
-                elif "authentication failures" in result.stderr.lower():
-                    logger.error("Authentication failed - check username and password")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error copying public key to remote host: {e}")
-            return False
-    
-    def test_key_authentication(self) -> bool:
-        """Test if key-based authentication works"""
-        try:
-            logger.info("Testing SSH key authentication...")
-            
-            cmd = [
-                'ssh',
-                '-i', str(self.private_key_path),
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'UserKnownHostsFile=/dev/null',
-                '-o', 'ConnectTimeout=10',
-                '-o', 'BatchMode=yes',  # No interactive prompts
-                '-o', 'PreferredAuthentications=publickey',  # Only use key auth
-                '-o', 'PubkeyAuthentication=yes',
-                '-o', 'PasswordAuthentication=no',  # Disable password auth
-                '-o', 'IdentitiesOnly=yes',  # Only use specified key
-                '-o', 'NumberOfPasswordPrompts=0',  # No password prompts
-                '-o', 'LogLevel=ERROR',  # Reduce verbose output
-                f"{self.config.ssh_user}@{self.config.ssh_host}",
-                'echo "SSH key authentication successful"'
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if result.returncode == 0 and "SSH key authentication successful" in result.stdout:
-                logger.info("SSH key authentication test passed")
-                return True
-            else:
-                logger.warning(f"SSH key authentication test failed")
-                logger.debug(f"Return code: {result.returncode}")
-                logger.debug(f"STDERR: {result.stderr.strip()}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error testing SSH key authentication: {e}")
-            return False
-    
-    def setup_ssh_config(self):
-        """Setup SSH config for optimized connections"""
-        try:
-            logger.info("Setting up SSH config for optimized connections...")
-            
-            host_config = f"""
-# KomniTrace optimized config for {self.config.ssh_host}
-Host {self.config.ssh_host}
-    HostName {self.config.ssh_host}
-    User {self.config.ssh_user}
-    IdentityFile {self.private_key_path}
-    IdentitiesOnly yes
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    
-    # Performance optimizations
-    ControlMaster auto
-    ControlPath ~/.ssh/control-%r@%h:%p
-    ControlPersist 300
-    
-    # Connection optimization
-    TCPKeepAlive yes
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-    ConnectTimeout 10
-    
-    # Compression and ciphers for speed
-    Compression yes
-    Cipher aes128-ctr
-    
-    # Disable unnecessary features for speed
-    GSSAPIAuthentication no
-    
-"""
-            
-            # Read existing config if it exists
-            existing_config = ""
-            if self.config_path.exists():
-                existing_config = self.config_path.read_text()
-            
-            # Check if our config already exists
-            if f"# KomniTrace optimized config for {self.config.ssh_host}" in existing_config:
-                logger.info("SSH config already contains KomniTrace settings")
-                return
-            
-            # Append our config
-            with open(self.config_path, 'a') as f:
-                f.write(host_config)
-            
-            # Set proper permissions
-            self.config_path.chmod(0o600)
-            
-            logger.info("SSH config updated with performance optimizations")
-            
-        except Exception as e:
-            logger.error(f"Error setting up SSH config: {e}")
-    
-    def clean_existing_keys(self):
-        """Remove existing SSH keys for this host"""
-        try:
-            logger.info(f"Cleaning existing SSH keys for {self.config.ssh_host}...")
-            
-            # Remove private and public keys
-            if self.private_key_path.exists():
-                self.private_key_path.unlink()
-                logger.info(f"Removed private key: {self.private_key_path}")
-            
-            if self.public_key_path.exists():
-                self.public_key_path.unlink()
-                logger.info(f"Removed public key: {self.public_key_path}")
-            
-            # Remove SSH config entry for this host
-            if self.config_path.exists():
-                config_content = self.config_path.read_text()
-                lines = config_content.split('\n')
-                
-                # Find and remove the block for this host
-                new_lines = []
-                skip_section = False
-                
-                for line in lines:
-                    if line.strip().startswith(f"# KomniTrace optimized config for {self.config.ssh_host}"):
-                        skip_section = True
-                        continue
-                    elif skip_section and line.strip().startswith("# KomniTrace optimized config for"):
-                        skip_section = False
-                        new_lines.append(line)
-                    elif skip_section and line.strip() == "":
-                        skip_section = False
-                        new_lines.append(line)
-                    elif not skip_section:
-                        new_lines.append(line)
-                
-                # Write back the cleaned config
-                self.config_path.write_text('\n'.join(new_lines))
-                logger.info("Removed SSH config entry")
-            
-        except Exception as e:
-            logger.warning(f"Error cleaning existing keys: {e}")
-    
-    def check_existing_key_auth(self) -> bool:
-        """Check if existing SSH key authentication already works"""
-        try:
-            if not self.private_key_path.exists():
-                return False
-                
-            logger.info("Checking if existing SSH key already works...")
-            
-            # Test current key without any setup
-            test_config = self.config
-            test_config.ssh_key = str(self.private_key_path)
-            test_config.ssh_password = None
-            
-            cmd = [
-                'ssh',
-                '-i', str(self.private_key_path),
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'UserKnownHostsFile=/dev/null',
-                '-o', 'ConnectTimeout=5',
-                '-o', 'BatchMode=yes',
-                '-o', 'PreferredAuthentications=publickey',
-                '-o', 'PasswordAuthentication=no',
-                '-o', 'IdentitiesOnly=yes',
-                '-o', 'NumberOfPasswordPrompts=0',
-                '-o', 'LogLevel=ERROR',
-                f"{self.config.ssh_user}@{self.config.ssh_host}",
-                'echo "existing_key_works"'
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0 and "existing_key_works" in result.stdout:
-                logger.info("Existing SSH key already works! Skipping key setup.")
-                # Update config to use existing key
-                self.config.ssh_key = str(self.private_key_path)
-                self.config.ssh_password = None
-                return True
-            else:
-                logger.debug("Existing SSH key doesn't work or doesn't exist")
-                return False
-                
-        except Exception as e:
-            logger.debug(f"Error checking existing key: {e}")
-            return False
-    
-    def setup_ssh_keys(self) -> bool:
-        """Complete SSH key setup process with retry logic"""
-        try:
-            if not self.config.ssh_password:
-                logger.info("No password provided, skipping SSH key setup")
-                return False
-            
-            # Clean existing keys if requested
-            if self.config.ssh_clean_keys:
-                self.clean_existing_keys()
-            
-            # First check if existing key already works (unless cleaning or forcing)
-            if not self.config.ssh_clean_keys and not self.config.ssh_setup_keys:
-                if self.check_existing_key_auth():
-                    return True
-                
-            self.ensure_ssh_dir()
-            
-            # Generate key if needed (or if forced)
-            if not self.generate_ssh_key():
-                return False
-            
-            # Copy public key to remote host using password
-            max_retries = 2
-            for attempt in range(max_retries):
-                if attempt > 0:
-                    wait_time = 10 * attempt  # Wait longer between retries
-                    logger.info(f"Waiting {wait_time} seconds before retry {attempt + 1}...")
-                    time.sleep(wait_time)
-                
-                logger.info(f"Attempt {attempt + 1} of {max_retries} to install SSH key...")
-                
-                if self.copy_public_key_to_remote():
-                    break
-                elif attempt == max_retries - 1:
-                    logger.error("Failed to install public key after all retries")
-                    return False
-                else:
-                    logger.warning(f"Attempt {attempt + 1} failed, will retry...")
-            
-            # Give the server a moment to process the key
-            time.sleep(2)
-            
-            # Test key authentication
-            if not self.test_key_authentication():
-                logger.warning("Key authentication test failed, but key might still work")
-                # Don't fail here - sometimes the test fails but the key works in practice
-            
-            # Setup SSH config optimizations
-            self.setup_ssh_config()
-            
-            # Update config to use key instead of password
-            self.config.ssh_key = str(self.private_key_path)
-            self.config.ssh_password = None  # Clear password since we now have key
-            
-            logger.info("SSH key setup completed successfully - future connections will be faster!")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during SSH key setup: {e}")
-            return False
+HEX32_RE = re.compile(r'^[0-9a-fA-F]{32}$')
+UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+# Estimated non-heap footprint of a Kafka CLI JVM (metaspace, code cache, threads)
+JVM_OVERHEAD_MB = 128
+# Default sshd MaxSessions is 10 per multiplexed connection; keep room for the control session
+SSH_MAX_SESSIONS = 8
+# Trailing offsets that may be transaction control records rather than missing data
+TRAILING_MARKER_TOLERANCE = 3
 
 
-def _check_ssh_dependencies():
-    """Check if required SSH tools are available"""
-    required_tools = ['ssh', 'ssh-keygen']
-    optional_tools = ['sshpass', 'ssh-copy-id']
-    
-    missing_required = []
-    missing_optional = []
-    
-    for tool in required_tools:
-        if shutil.which(tool) is None:
-            missing_required.append(tool)
-    
-    for tool in optional_tools:
-        if shutil.which(tool) is None:
-            missing_optional.append(tool)
-    
-    if missing_required:
-        logger.error(f"Required SSH tools missing: {', '.join(missing_required)}")
-        logger.error("Please install OpenSSH client")
-        return False
-    
-    if missing_optional:
-        logger.warning(f"Optional SSH tools missing: {', '.join(missing_optional)}")
-        logger.warning("Consider installing: sudo apt-get install sshpass")
-    
-    return True
+def setup_logging(output_dir: str, verbose: bool):
+    os.makedirs(output_dir, exist_ok=True)
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    file_handler = logging.FileHandler(os.path.join(output_dir, 'komni_trace.log'))
+    file_handler.setFormatter(fmt)
+    file_handler.setLevel(logging.DEBUG)
+    # Root handlers so komni_reports logs land in the same places; only our logger goes down to DEBUG
+    root = logging.getLogger()
+    root.handlers[:] = [console, file_handler]
+    root.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
+
+
+# --------------------------------------------------------------------------------------
+# Configuration and data model
+# --------------------------------------------------------------------------------------
 
 @dataclass
 class KafkaEvent:
@@ -498,6 +118,9 @@ class KafkaEvent:
     raw_data: Dict[str, Any]
     partition: Optional[int] = None
     offset: Optional[int] = None
+    key: Optional[str] = None
+    headers: Optional[str] = None
+
 
 @dataclass
 class TraceConfig:
@@ -505,792 +128,1008 @@ class TraceConfig:
     namespace: str
     device_id: str
     kafka_broker: str
-    max_age_hours: int = 24*8
-    max_parallel_topics: int = 7
+    max_age_hours: int = 24 * 8
+    since: Optional[datetime] = None
+    until: Optional[datetime] = None
+    max_parallel_topics: int = 4
     output_dir: str = "./trace_output"
-    # El timeout del consumidor ahora es un guardián, no el mecanismo principal de parada
-    consumer_inactivity_timeout: int = 15  # seconds
+    consumer_inactivity_timeout: int = 15  # seconds without records before a partition read gives up
+    partition_timeout: int = 900  # hard wall-clock cap per partition read (enforced inside the pod)
     topic_filter: Optional[str] = None
-    topic_list: Optional[List[str]] = None  # Explicit list of topics to process
-    max_messages: Optional[int] = None
+    topic_regex: Optional[str] = None
+    exclude_regex: Optional[str] = r'^_'
+    topic_list: Optional[List[str]] = None
+    max_messages: Optional[int] = None  # per partition, newest messages win
+    max_total_messages: int = 20_000_000
+    extra_terms: List[str] = field(default_factory=list)
+    remote_filter: bool = True
+    partitions_per_exec: int = 16
     ssh_host: Optional[str] = None
     ssh_user: Optional[str] = None
     ssh_password: Optional[str] = None
-    ssh_key: Optional[str] = None  # SSH private key file path
-    ssh_setup_keys: bool = False  # Force SSH key setup
-    ssh_no_key_setup: bool = False  # Disable automatic key setup
-    ssh_clean_keys: bool = False  # Remove existing keys before setup
+    ssh_key: Optional[str] = None
+    ssh_setup_keys: bool = False
+    ssh_no_key_setup: bool = False
+    ssh_clean_keys: bool = False
+    ssh_insecure: bool = False
     kafka_pod_selector: str = "deployment/kafka"
     kafka_container: Optional[str] = None
-    skip_offset_check: bool = False  # Skip offset checking if SSH is problematic
+    kafka_bin_dir: Optional[str] = None
+    kafka_client_config: Optional[str] = None  # path INSIDE the pod (SASL/SSL properties)
+    kubectl: str = "kubectl"
+    kube_context: Optional[str] = None
+    tool_heap: str = "256m"
+    client_id: str = "komnitrace"
+    assume_yes: bool = False
+    dry_run: bool = False
+    unsafe: bool = False
 
 
-def _contains_device_id(data: Dict[str, Any], device_id: str) -> bool:
-    """Check if the JSON data contains the target device_id anywhere in the text"""
-    try:
-        json_text = JSON_DUMPS(data)
-        device_id_lower = device_id.lower()
-        json_text_lower = json_text.lower()
-        result = device_id_lower in json_text_lower
-        
-        # Debug: Log search details for first few checks
-        global message_check_count
-        if 'message_check_count' not in globals():
-            message_check_count = 0
-        message_check_count += 1
-        
-        # Enhanced debugging for the first few messages or when we find matches
-        if message_check_count <= 5 or result:
-            logger.info(f"Device ID check #{message_check_count}: Looking for '{device_id_lower}' in message of length {len(json_text)}")
-            logger.info(f"Match found: {result}")
-            
-            # Show more context if it's a short message or if we found a match
-            if len(json_text) < 1000 or result:
-                logger.info(f"Full message content: {json_text}")
-            else:
-                logger.info(f"Message preview: {json_text[:300]}...{json_text[-200:]}")
-        
-        return result
-    except Exception as e:
-        logger.warning(f"Error in _contains_device_id: {e}")
-        # Fallback to string search
-        try:
-            return device_id.lower() in str(data).lower()
-        except:
-            return False
+@dataclass
+class PartitionTask:
+    topic: str
+    partition: int
+    earliest: int
+    latest: int
+    start: int
+    end: int
+    capped: bool = False
+    retention_hit: bool = False
+
+    @property
+    def expected(self) -> int:
+        return max(0, self.end - self.start)
 
 
-def _extract_event_type(data: Dict[str, Any]) -> str:
-    """Extract event type from JSON data"""
-    possible_keys = ['event_type', 'action_type', 'eventType', 'actionType', 'type', 'action', 'operation', 'method']
-    for key in possible_keys:
-        if key in data and data[key]:
-            event_type = str(data[key]).strip()
-            if event_type:
-                return event_type
-    if 'message' in data:
-        return 'log_message'
-    elif 'error' in data or 'exception' in data:
-        return 'error'
-    else:
-        return 'unknown'
+@dataclass
+class PartitionResult:
+    topic: str
+    partition: int
+    earliest: int
+    latest: int
+    start: int
+    end: int
+    expected: int
+    consumed: Optional[int] = None
+    last_offset: Optional[int] = None
+    matches: int = 0
+    rc: Optional[int] = None
+    status: str = "not_run"
+    note: str = ""
+    capped: bool = False
+    retention_hit: bool = False
 
 
-def _execute_remote_command(config: TraceConfig, cmd: List[str], timeout: int = 60) -> subprocess.CompletedProcess:
-    """Execute a command on the remote SSH host if configured, otherwise locally"""
-    if config.ssh_host and config.ssh_user:
-        # Build SSH command with optimizations
-        ssh_cmd = ["ssh"]
-        
-        # Add key authentication if available
-        if config.ssh_key and Path(config.ssh_key).exists():
-            ssh_cmd.extend([
-                "-i", config.ssh_key,
-                "-o", "PreferredAuthentications=publickey",
-                "-o", "BatchMode=yes"
-            ])
-        elif config.ssh_password:
-            # Use password authentication with sshpass
-            ssh_cmd = ["sshpass", "-p", config.ssh_password] + ssh_cmd
-            ssh_cmd.extend(["-o", "PreferredAuthentications=password"])
-        
-        # Add performance optimizations
-        ssh_cmd.extend([
-            "-o", "StrictHostKeyChecking=no", 
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ControlMaster=auto",
-            f"-o", f"ControlPath=~/.ssh/control-%r@%h:%p",
-            "-o", "ControlPersist=300",
-            "-o", "Compression=yes",
-            "-o", "TCPKeepAlive=yes",
-            f"{config.ssh_user}@{config.ssh_host}"
-        ])
-        
-        remote_cmd = " ".join([f"'{arg}'" if " " in arg else arg for arg in cmd])
-        full_cmd = ssh_cmd + [remote_cmd]
-        
-        auth_method = "key" if config.ssh_key else "password"
-        logger.debug(f"Executing SSH command ({auth_method} auth, timeout={timeout}s): {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
-            if result.returncode != 0:
-                logger.debug(f"SSH command failed with return code {result.returncode}")
-                logger.debug(f"SSH STDERR: {result.stderr}")
-            return result
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"SSH command timed out after {timeout}s: {' '.join(cmd)}")
-            raise
-        except Exception as e:
-            logger.error(f"SSH command failed: {e}")
-            raise
-    else:
-        logger.debug(f"Executing local command: {' '.join(cmd)}")
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+# --------------------------------------------------------------------------------------
+# SSH key management (opt-in; multiplexing already removes the need for keys)
+# --------------------------------------------------------------------------------------
 
+class SSHKeyManager:
+    """Manages a dedicated SSH key per host. Only installs keys when explicitly asked to."""
 
-def _execute_remote_popen(config: TraceConfig, cmd: List[str]) -> subprocess.Popen:
-    """Execute a command on the remote SSH host using Popen if configured, otherwise locally"""
-    if config.ssh_host and config.ssh_user:
-        # Build SSH command with optimizations
-        ssh_cmd = ["ssh"]
-        
-        # Add key authentication if available
-        if config.ssh_key and Path(config.ssh_key).exists():
-            ssh_cmd.extend([
-                "-i", config.ssh_key,
-                "-o", "PreferredAuthentications=publickey",
-                "-o", "BatchMode=yes"
-            ])
-        elif config.ssh_password:
-            # Use password authentication with sshpass
-            ssh_cmd = ["sshpass", "-p", config.ssh_password] + ssh_cmd
-            ssh_cmd.extend(["-o", "PreferredAuthentications=password"])
-        
-        # Add performance optimizations
-        ssh_cmd.extend([
-            "-o", "StrictHostKeyChecking=no", 
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ControlMaster=auto",
-            f"-o", f"ControlPath=~/.ssh/control-%r@%h:%p",
-            "-o", "ControlPersist=300",
-            "-o", "Compression=yes",
-            "-o", "TCPKeepAlive=yes",
-            f"{config.ssh_user}@{config.ssh_host}"
-        ])
-        
-        remote_cmd = " ".join([f"'{arg}'" if " " in arg else arg for arg in cmd])
-        full_cmd = ssh_cmd + [remote_cmd]
-        
-        auth_method = "key" if config.ssh_key else "password"
-        logger.debug(f"Executing SSH Popen command ({auth_method} auth): {' '.join(cmd)}")
-        
-        return subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, bufsize=1, universal_newlines=True)
-    else:
-        logger.debug(f"Executing local Popen command: {' '.join(cmd)}")
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, bufsize=1, universal_newlines=True)
-
-
-def _get_topic_end_offsets(topic: str, config: TraceConfig) -> Dict[int, int]:
-    """
-    Get the end offsets for all partitions of a given topic.
-    Returns a dictionary mapping partition_id -> end_offset.
-    """
-    logger.info(f"Getting end offsets for topic: {topic}")
-    offsets = {}
-    try:
-        # Use kafka-get-offsets.sh directly (available as alias/in PATH)
-        inner_cmd = [
-            "env", "JMX_PORT=",  # Clear JMX_PORT to avoid issues
-            "kafka-get-offsets.sh",
-            "--broker-list", config.kafka_broker,
-            "--topic", topic,
-            "--time", "-1"  # -1 means latest offset
-        ]
-        
-        inner_cmd_str = " ".join(shlex.quote(c) for c in inner_cmd)
-        
-        # Log the command being executed
-        logger.info(f"Command to execute: {inner_cmd_str}")
-
-        cmd = [
-            "kubectl", "exec", "-n", config.namespace,
-            config.kafka_pod_selector
-        ]
-        if config.kafka_container:
-            cmd.extend(["-c", config.kafka_container])
-        cmd.extend(["--", "sh", "-c", inner_cmd_str])
-
-        # Print the full command for debugging
-        logger.info(f"Executing command to get offsets: {' '.join(cmd)}")
-        
-        result = _execute_remote_command(config, cmd, timeout=45)  # Increased timeout from 30 to 45 seconds
-
-        if result.returncode != 0:
-            # Print full debug information
-            logger.error(f"Failed to get offsets for topic {topic}:")
-            logger.error(f"  Return code: {result.returncode}")
-            logger.error(f"  STDOUT: {result.stdout.strip()}")
-            logger.error(f"  STDERR: {result.stderr.strip()}")
-            return {}
-
-        # Output format is: topic:partition:offset
-        for line in result.stdout.strip().split('\n'):
-            if not line.strip():
-                continue
-            parts = line.strip().split(':')
-            if len(parts) == 3:
-                try:
-                    partition = int(parts[1])
-                    offset = int(parts[2])
-                    offsets[partition] = offset
-                except (ValueError, IndexError):
-                    logger.warning(f"Could not parse offset line: '{line}'")
-        
-        logger.info(f"End offsets for topic {topic}: {offsets}")
-        return offsets
-
-    except Exception as e:
-        logger.error(f"Exception while getting offsets for topic {topic}: {e}")
-        return {}
-
-
-def consume_topic_process(topic: str, config: TraceConfig, temp_dir: str) -> str:
-    """
-    Process function to consume a single Kafka topic until end offsets are reached.
-    Writes its results to a separate file and returns the path.
-    """
-    process_id = os.getpid()
-    output_file = os.path.join(temp_dir, f"topic_{topic}_{process_id}_{uuid.uuid4().hex}.json")
-    
-    logger.info(f"Process {process_id} starting for topic: {topic}")
-    time.sleep(random.uniform(0.1, 1.5)) # Stagger start
-
-    try:
-        # 1. Get the target end offsets before starting the consumer (if not skipping)
-        if config.skip_offset_check:
-            logger.info(f"Process {process_id}: Skipping offset check for topic {topic} due to configuration")
-            end_offsets = {}
-            partitions_to_check = {}
-            partitions_finished = {}
-        else:
-            end_offsets = _get_topic_end_offsets(topic, config)
-            if not end_offsets:
-                logger.warning(f"Process {process_id}: Could not determine end offsets for topic {topic}. Continuing without offset tracking.")
-                end_offsets = {}
-                partitions_to_check = {}
-                partitions_finished = {}
-            else:
-                # A dictionary to track if we've reached the end for each partition
-                # We only track partitions that have messages (offset > 0)
-                partitions_to_check = {p: o for p, o in end_offsets.items() if o > 0}
-                partitions_finished = {p: False for p in partitions_to_check}
-
-        # If all partitions are empty, we are done.
-        if not partitions_to_check:
-            logger.info(f"Process {process_id}: Topic {topic} is empty or has no messages. Skipping consumption.")
-            with open(output_file, 'wb') as f:
-                f.write(JSON_DUMPS_BYTES([]))
-            return output_file
-        
-        # Quick test: get a sample message to verify topic accessibility
-        test_cmd = [
-            "env", "JMX_PORT=",
-            "kafka-console-consumer.sh",
-            "--bootstrap-server", config.kafka_broker,
-            "--topic", topic,
-            "--from-beginning",
-            "--max-messages", "1",
-            "--timeout-ms", "8000"  # Increased timeout for slower networks
-        ]
-        test_cmd_str = " ".join(shlex.quote(c) for c in test_cmd)
-        test_full_cmd = [
-            "kubectl", "exec", "-n", config.namespace,
-            config.kafka_pod_selector
-        ]
-        if config.kafka_container:
-            test_full_cmd.extend(["-c", config.kafka_container])
-        test_full_cmd.extend(["--", "sh", "-c", test_cmd_str])
-        
-        logger.info(f"Process {process_id} testing topic accessibility for {topic}")
-        try:
-            test_result = _execute_remote_command(config, test_full_cmd, timeout=20)  # Increased SSH timeout
-            if test_result.returncode != 0:
-                logger.warning(f"Process {process_id} topic test failed for {topic}: {test_result.stderr.strip()}")
-            else:
-                logger.info(f"Process {process_id} topic {topic} is accessible, found sample data: {'Yes' if test_result.stdout.strip() else 'No'}")
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Process {process_id} topic accessibility test timed out for {topic} - continuing anyway")
-        except Exception as e:
-            logger.warning(f"Process {process_id} topic accessibility test failed for {topic}: {e} - continuing anyway")
-        
-        # 2. Build and execute the consumer command with optimized settings
-        consumer_parts = [
-            "env", "JMX_PORT=",
-            "kafka-console-consumer.sh",
-            "--bootstrap-server", config.kafka_broker,
-            "--topic", topic,
-            "--from-beginning",
-            # Optimize for faster consumption and termination
-            "--consumer-property", "session.timeout.ms=6000",
-            "--consumer-property", "heartbeat.interval.ms=2000", 
-            "--consumer-property", "fetch.min.bytes=1",
-            "--consumer-property", "fetch.max.wait.ms=1000",  # Reduced from 500 to 1000
-            "--consumer-property", "max.partition.fetch.bytes=1048576",  # 1MB instead of 10MB
-            "--consumer-property", "enable.auto.commit=false",  # Don't commit offsets
-            "--property", "print.timestamp=true",
-            # Remove partition and offset printing since they seem to be causing issues
-            # "--property", "print.partition=true",
-            # "--property", "print.offset=true",
-        ]
-        if config.max_messages is not None:
-            consumer_parts.extend(["--max-messages", str(config.max_messages)])
-        
-        # Use timeout to force consumer termination after reasonable time
-        timeout_cmd = f"timeout {config.consumer_inactivity_timeout + 10}"  # Give more buffer time
-        inner_cmd_str = timeout_cmd + " " + " ".join(shlex.quote(c) for c in consumer_parts)
-        
-        # Log the consumer command for debugging
-        logger.info(f"Process {process_id} consumer command: {inner_cmd_str}")
-        
-        cmd = [
-            "kubectl", "exec", "-n", config.namespace,
-            config.kafka_pod_selector
-        ]
-        if config.kafka_container:
-            cmd.extend(["-c", config.kafka_container])
-        cmd.extend(["--", "sh", "-c", inner_cmd_str])
-        
-        logger.info(f"Process {process_id} consuming topic {topic} until offsets {partitions_to_check} are met.")
-
-        events_found = []
-        start_time = time.time()
-        last_activity_time = start_time
-
-        try:
-            with _execute_remote_popen(config, cmd) as proc:
-                if proc.stdout is None:
-                    stderr_text = proc.stderr.read() if proc.stderr else "N/A"
-                    logger.error(f"Process {process_id} failed to start consumer for topic {topic}. Stderr: {stderr_text.strip()}")
-                    with open(output_file, 'wb') as f: f.write(JSON_DUMPS_BYTES([]));
-                    return output_file
-
-                # 3. Read output with simplified approach
-                messages_processed = 0
-                start_time = time.time()
-                all_messages = []  # Store all messages for debugging
-                
-                logger.info(f"Process {process_id} starting to read messages from topic {topic}")
-                
-                try:
-                    for line in proc.stdout:
-                        if not line.strip():
-                            continue
-
-                        messages_processed += 1
-                        
-                        # Log progress more frequently at the beginning
-                        if messages_processed <= 10 or messages_processed % 50 == 0:
-                            logger.info(f"Process {process_id} processed {messages_processed} messages from {topic}")
-
-                        # First, store the raw line for debugging - ALWAYS
-                        raw_debug_info = {
-                            "message_number": messages_processed,
-                            "raw_line": line.strip()
-                        }
-                        all_messages.append(raw_debug_info)
-                        
-                        try:
-                            # Parse line: CreateTime:ts\tmessage (simplified format)
-                            parts = line.strip().split('\t', 1)
-                            if len(parts) < 2: 
-                                # Update the debug info to show why it was skipped
-                                raw_debug_info["skip_reason"] = "Less than 2 parts after tab split"
-                                raw_debug_info["parts_count"] = len(parts)
-                                continue
-                            
-                            metadata, message = parts
-                            timestamp_str = None
-                            
-                            # Parse metadata - look for timestamp
-                            for part in metadata.split():
-                                if part.startswith('CreateTime:'): 
-                                    timestamp_str = part.split(':', 1)[1]
-                                    break
-                            
-                            # If no timestamp in metadata, maybe the whole metadata IS the timestamp
-                            if not timestamp_str and metadata.isdigit():
-                                timestamp_str = metadata
-
-                            # We need at least timestamp to proceed
-                            if not timestamp_str: 
-                                # Update the debug info to show parsing details
-                                raw_debug_info["skip_reason"] = "Missing timestamp"
-                                raw_debug_info["metadata"] = metadata
-                                continue
-                            
-                            event_timestamp = datetime.fromtimestamp(int(timestamp_str) / 1000)
-                            # Use default values for partition and offset since we're not printing them
-                            partition = 0
-                            offset = messages_processed  # Use message number as offset
-
-                            # Update debug info with parsed data
-                            raw_debug_info.update({
-                                "timestamp": event_timestamp.isoformat(),
-                                "partition": partition,
-                                "offset": offset,
-                                "raw_message": message,
-                                "metadata": metadata,
-                                "parsed_successfully": True
-                            })
-
-                            # Time filtering
-                            if config.max_age_hours > 0:
-                                cutoff_time = datetime.now() - timedelta(hours=config.max_age_hours)
-                                if event_timestamp < cutoff_time:
-                                    raw_debug_info["skip_reason"] = "Message too old"
-                                    raw_debug_info["cutoff_time"] = cutoff_time.isoformat()
-                                    continue
-                            
-                            # Parse JSON and create event
-                            try:
-                                json_data = JSON_LOADS(message)
-                                raw_debug_info["json_parsed"] = True
-                            except JSON_DECODE_ERROR as e:
-                                json_data = {"raw_message": message}
-                                raw_debug_info["json_parsed"] = False
-                                raw_debug_info["json_error"] = str(e)
-
-                            # Debug: Log a few sample messages to see the structure
-                            if messages_processed <= 5:
-                                logger.info(f"Process {process_id} sample message {messages_processed}: {message[:200]}...")
-
-                            # Since we're not tracking real partitions/offsets, use a simpler termination logic
-                            # We'll rely on the timeout mechanism instead of offset tracking
-                            
-                            # Check if message contains our device_id
-                            contains_device = _contains_device_id(json_data, config.device_id)
-                            raw_debug_info["contains_device_id"] = contains_device
-                            
-                            # Only save events that contain our device_id
-                            if contains_device:
-                                event = {
-                                    "timestamp": event_timestamp.isoformat(), "topic": topic,
-                                    "device_id": config.device_id, "event_type": _extract_event_type(json_data),
-                                    "message": message, "raw_data": json_data,
-                                    "partition": partition, "offset": offset
-                                }
-                                events_found.append(event)
-                                raw_debug_info["event_saved"] = True
-                                logger.info(f"Process {process_id} found event in {topic}:{partition}@{offset}")
-                            else:
-                                raw_debug_info["event_saved"] = False
-                                # Debug: Log why message was filtered out (only for first few messages)
-                                if messages_processed <= 3:
-                                    logger.info(f"Process {process_id} message {messages_processed} does not contain device_id '{config.device_id}'")
-
-                            # For now, let the timeout handle termination since we don't have reliable partition/offset info
-                            # Check if all partitions are finished
-                            # if all(partitions_finished.values()):
-                            #     logger.info(f"Process {process_id}: All target offsets reached for topic {topic}. Terminating consumer after {messages_processed} messages.")
-                            #     break
-
-                        except Exception as e:
-                            logger.error(f"Process {process_id} error parsing line from topic {topic}: {e}")
-                            # Update debug info with error details
-                            if 'raw_debug_info' in locals():
-                                raw_debug_info["parsing_error"] = str(e)
-                                raw_debug_info["parsing_error_type"] = type(e).__name__
-                            continue
-
-                except Exception as e:
-                    logger.error(f"Process {process_id} error reading from stdout: {e}")
-                
-                # Save ALL messages to debug file (optional, can be enabled for debugging)
-                if False:  # Set to True to enable debug file generation
-                    os.makedirs(config.output_dir, exist_ok=True)
-                    debug_file = os.path.join(config.output_dir, f"debug_all_messages_{topic}_{process_id}.json")
-                    try:
-                        with open(debug_file, 'w', encoding='utf-8') as f:
-                            f.write(json.dumps(all_messages, indent=2))
-                        logger.info(f"Process {process_id} saved all {len(all_messages)} messages to debug file: {debug_file}")
-                    except Exception as e:
-                        logger.error(f"Process {process_id} failed to save debug file: {e}")
-                
-                logger.info(f"Process {process_id} finished reading {messages_processed} total messages from topic {topic}")
-                
-                # Safety check: if we haven't finished all partitions, log it
-                if not all(partitions_finished.values()):
-                    unfinished = [p for p, finished in partitions_finished.items() if not finished]
-                    logger.warning(f"Process {process_id} for topic {topic} finished but partitions {unfinished} were not completed. This is normal if those partitions don't have enough messages.")
-
-                # Terminate the process gracefully
-                if proc.poll() is None:  # If still running
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"Process {process_id} for topic {topic} did not terminate gracefully, killing.")
-                        proc.kill()
-
-        except Exception as e:
-            logger.error(f"Process {process_id} encountered error in main consumer block for topic {topic}: {e}", exc_info=True)
-
-
-        total_elapsed = time.time() - start_time
-        logger.info(f"Process {process_id} completed for topic {topic}. Found {len(events_found)} events in {total_elapsed:.2f}s.")
-
-        with open(output_file, 'wb') as f:
-            f.write(JSON_DUMPS_BYTES(events_found))
-        return output_file
-
-    except Exception as e:
-        logger.error(f"Process {process_id} encountered a fatal error for topic {topic}: {e}", exc_info=True)
-        with open(output_file, 'wb') as f:
-            f.write(JSON_DUMPS_BYTES([]))
-        return output_file
-
-
-class KomniTracer:
-    """Main class for tracing Kafka events across topics"""
-    
     def __init__(self, config: TraceConfig):
         self.config = config
-        self.events: List[KafkaEvent] = []
-        self.temp_dir = tempfile.mkdtemp(prefix="komni_trace_")
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        logger.info(f"KomniTracer initialized for device_id: {config.device_id}")
-        logger.info(f"Using temporary directory: {self.temp_dir}")
-        
-        # Test SSH connectivity if configured
-        if config.ssh_host:
-            self._test_ssh_connectivity()
-    
-    def _test_ssh_connectivity(self):
-        """Test SSH connectivity and setup SSH keys for improved performance"""
+        self.ssh_dir = Path.home() / '.ssh'
+        self.key_name = f"komni_trace_{config.ssh_host.replace('.', '_')}"
+        self.private_key_path = self.ssh_dir / self.key_name
+        self.public_key_path = self.ssh_dir / f"{self.key_name}.pub"
+        self.config_path = self.ssh_dir / 'config'
+
+    def _host_key_opts(self) -> List[str]:
+        if self.config.ssh_insecure:
+            return ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null']
+        return ['-o', 'StrictHostKeyChecking=accept-new']
+
+    def _password_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        env['SSHPASS'] = self.config.ssh_password or ''
+        return env
+
+    def generate_ssh_key(self) -> bool:
+        if self.private_key_path.exists():
+            logger.info(f"SSH key already exists: {self.private_key_path}")
+            return True
+        self.ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        logger.info(f"Generating ed25519 SSH key for {self.config.ssh_host}...")
+        cmd = ['ssh-keygen', '-t', 'ed25519', '-f', str(self.private_key_path), '-N', '',
+               '-C', f'komni_trace_{self.config.ssh_host}_{int(time.time())}']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.error(f"Failed to generate SSH key: {result.stderr.strip()}")
+            return False
+        self.private_key_path.chmod(0o600)
+        return True
+
+    def copy_public_key_to_remote(self) -> bool:
+        if not self.public_key_path.exists() or not shutil.which('sshpass'):
+            logger.error("Public key missing or sshpass not installed; cannot install key")
+            return False
+        public_key = self.public_key_path.read_text().strip()
+        setup_cmd = (
+            "umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && "
+            f"(grep -qxF {shlex.quote(public_key)} ~/.ssh/authorized_keys || "
+            f"echo {shlex.quote(public_key)} >> ~/.ssh/authorized_keys)"
+        )
+        cmd = ['sshpass', '-e', 'ssh', *self._host_key_opts(),
+               '-o', 'ConnectTimeout=10', '-o', 'PreferredAuthentications=password,keyboard-interactive',
+               '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1', '-o', 'LogLevel=ERROR',
+               f"{self.config.ssh_user}@{self.config.ssh_host}", setup_cmd]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45, env=self._password_env())
+        if result.returncode != 0:
+            logger.error(f"Failed to install public key: {result.stderr.strip()}")
+            return False
+        logger.info("Public key installed on remote host")
+        return True
+
+    def key_works(self) -> bool:
+        if not self.private_key_path.exists():
+            return False
+        cmd = ['ssh', '-i', str(self.private_key_path), *self._host_key_opts(),
+               '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+               '-o', 'PreferredAuthentications=publickey', '-o', 'LogLevel=ERROR',
+               f"{self.config.ssh_user}@{self.config.ssh_host}", 'echo komni_key_ok']
         try:
-            logger.info(f"Testing SSH connectivity to {self.config.ssh_host}...")
-            
-            # Check SSH dependencies first
-            if not _check_ssh_dependencies():
-                raise Exception("Required SSH tools are not available")
-            
-            # Try initial connection test
-            test_cmd = ["echo", "SSH connection test successful"]
-            result = _execute_remote_command(self.config, test_cmd, timeout=15)
-            
-            if result.returncode == 0:
-                auth_method = "key" if self.config.ssh_key else "password"
-                logger.info(f"SSH connectivity test successful using {auth_method} authentication")
-                logger.info(f"SSH response: {result.stdout.strip()}")
-                
-                # If using password, try to set up SSH keys for future performance
-                if (self.config.ssh_password and not self.config.ssh_key and 
-                    not self.config.ssh_no_key_setup):
-                    logger.info("Setting up SSH keys for improved performance...")
-                    ssh_manager = SSHKeyManager(self.config)
-                    
-                    # Check if we should force setup even if keys exist
-                    should_setup = self.config.ssh_setup_keys or not ssh_manager.private_key_path.exists()
-                    
-                    if should_setup and ssh_manager.setup_ssh_keys():
-                        logger.info("🚀 SSH keys configured! Future connections will be faster and password-free.")
-                        
-                        # Update our config to use the new key
-                        self.config.ssh_key = ssh_manager.config.ssh_key
-                        self.config.ssh_password = ssh_manager.config.ssh_password
-                        
-                        # Test the new key-based connection
-                        test_result = _execute_remote_command(self.config, test_cmd, timeout=10)
-                        if test_result.returncode == 0:
-                            logger.info("✅ Key-based authentication confirmed working")
-                        else:
-                            logger.warning("⚠️ Key setup completed but test failed, falling back to password")
-                            # Restore password if key test failed
-                            self.config.ssh_password = ssh_manager.config.ssh_password or self.config.ssh_password
-                            self.config.ssh_key = None
-                    elif not should_setup:
-                        logger.info("SSH keys already exist, use --ssh-setup-keys to force regeneration")
-                    else:
-                        logger.warning("SSH key setup failed, continuing with password authentication")
-                elif self.config.ssh_no_key_setup:
-                    logger.info("SSH key setup disabled by --ssh-no-key-setup flag")
-                
-                return
-            else:
-                logger.error(f"SSH connectivity test failed with return code {result.returncode}")
-                logger.error(f"SSH STDOUT: {result.stdout.strip()}")
-                logger.error(f"SSH STDERR: {result.stderr.strip()}")
-                
-                # Provide helpful suggestions
-                suggestions = []
-                if "Permission denied" in result.stderr:
-                    suggestions.append("- Check SSH username and password/key")
-                    suggestions.append("- Verify SSH service is running on target host")
-                    suggestions.append("- Ensure password authentication is enabled on the server")
-                if "Connection refused" in result.stderr:
-                    suggestions.append("- Check if SSH service is running on port 22")
-                    suggestions.append("- Verify firewall allows SSH connections")
-                if "No route to host" in result.stderr:
-                    suggestions.append("- Check network connectivity to target host")
-                    suggestions.append("- Verify IP address is correct")
-                if "sshpass" in result.stderr and "command not found" in result.stderr:
-                    suggestions.append("- Install sshpass: sudo apt-get install sshpass")
-                    suggestions.append("- Or provide SSH key instead of password")
-                
-                if suggestions:
-                    logger.error("Possible solutions:")
-                    for suggestion in suggestions:
-                        logger.error(suggestion)
-                
-                raise Exception(f"SSH connectivity test failed: {result.stderr.strip()}")
-                
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
-            logger.error("SSH connectivity test timed out after 15 seconds")
-            raise Exception("SSH connection timeout - check network connectivity")
-        except Exception as e:
-            logger.error(f"SSH connectivity test failed: {e}")
-            raise Exception(f"Cannot establish SSH connection to {self.config.ssh_host}: {e}")
+            return False
+        return result.returncode == 0 and 'komni_key_ok' in result.stdout
+
+    def clean_existing_keys(self):
+        """Remove the dedicated key and any legacy ~/.ssh/config block written by older versions"""
+        for path in (self.private_key_path, self.public_key_path):
+            if path.exists():
+                path.unlink()
+                logger.info(f"Removed {path}")
+        if self.config_path.exists():
+            marker = f"# KomniTrace optimized config for {self.config.ssh_host}"
+            lines = self.config_path.read_text().split('\n')
+            new_lines, skip = [], False
+            for line in lines:
+                stripped = line.strip()
+                if stripped == marker:
+                    skip = True
+                    continue
+                if skip and stripped.startswith('Host ') and not stripped.endswith(self.config.ssh_host):
+                    skip = False
+                if skip and stripped.startswith('# KomniTrace optimized config for'):
+                    skip = False
+                if not skip:
+                    new_lines.append(line)
+            self.config_path.write_text('\n'.join(new_lines))
+
+    def resolve(self) -> Optional[str]:
+        """Return a working key path, installing one only when --ssh-setup-keys is set."""
+        if self.config.ssh_clean_keys:
+            self.clean_existing_keys()
+        if self.key_works():
+            logger.info(f"Reusing working SSH key {self.private_key_path}")
+            return str(self.private_key_path)
+        if not self.config.ssh_setup_keys or not self.config.ssh_password:
+            return None
+        if self.generate_ssh_key() and self.copy_public_key_to_remote() and self.key_works():
+            logger.info("SSH key installed and verified")
+            return str(self.private_key_path)
+        logger.warning("SSH key setup failed, continuing with password authentication")
+        return None
+
+
+def _check_ssh_dependencies(config: TraceConfig) -> bool:
+    if shutil.which('ssh') is None:
+        logger.error("OpenSSH client (ssh) is required for remote execution")
+        return False
+    if config.ssh_password and shutil.which('sshpass') is None:
+        logger.error("Password authentication requires sshpass (e.g. apt-get install sshpass) or use --ssh-key")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------------------
+# Command transport: local kubectl, or kubectl on a remote host through one multiplexed SSH connection
+# --------------------------------------------------------------------------------------
+
+class Transport:
+    def __init__(self, config: TraceConfig):
+        self.config = config
+        self.remote = bool(config.ssh_host and config.ssh_user)
+        self.control_dir = tempfile.mkdtemp(prefix="kt-ssh-") if self.remote else None
+        self.master_open = False
+        self.env = os.environ.copy()
+        if config.ssh_password:
+            self.env['SSHPASS'] = config.ssh_password
+        self._procs = set()
+        self._lock = threading.Lock()
+
+    # --- SSH ---
+    def _ssh_base(self, master: bool = False) -> List[str]:
+        c = self.config
+        cmd = []
+        if c.ssh_password and not c.ssh_key:
+            cmd += ['sshpass', '-e']
+        cmd += ['ssh']
+        if c.ssh_key:
+            cmd += ['-i', os.path.expanduser(c.ssh_key), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes']
+        if c.ssh_insecure:
+            cmd += ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null']
+        else:
+            cmd += ['-o', 'StrictHostKeyChecking=accept-new']
+        cmd += ['-o', f'ControlPath={self.control_dir}/%C',
+                '-o', 'ControlMaster=yes' if master else 'ControlMaster=no',
+                '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4',
+                '-o', 'Compression=yes', '-o', 'LogLevel=ERROR']
+        return cmd
+
+    def open(self):
+        if not self.remote:
+            if shutil.which(shlex.split(self.config.kubectl)[0]) is None:
+                raise RuntimeError(f"'{self.config.kubectl}' not found locally; use --ssh-host or --kubectl")
+            return
+        if not _check_ssh_dependencies(self.config):
+            raise RuntimeError("Missing SSH tooling")
+        if not self.config.ssh_key and not self.config.ssh_no_key_setup:
+            key = SSHKeyManager(self.config).resolve()
+            if key:
+                self.config.ssh_key = key
+        # One authenticated master connection; every later command is multiplexed over it
+        # (no re-authentication, so password auth works with parallelism too).
+        # stderr goes to a file: a backgrounded master would keep a pipe open forever.
+        target = f"{self.config.ssh_user}@{self.config.ssh_host}"
+        with tempfile.TemporaryFile() as err:
+            cmd = self._ssh_base(master=True) + ['-o', 'ControlPersist=900', '-N', '-f', target]
+            try:
+                rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                                    env=self.env, timeout=40).returncode
+            except subprocess.TimeoutExpired:
+                rc = -1
+            err.seek(0)
+            err_text = err.read().decode(errors='replace').strip()
+        if rc == 0:
+            self.master_open = True
+            logger.info(f"SSH master connection established to {target} (multiplexed)")
+        else:
+            hint = ""
+            if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err_text or "Host key verification failed" in err_text:
+                hint = " (host key changed: fix ~/.ssh/known_hosts or pass --ssh-insecure for lab hosts)"
+            elif "Permission denied" in err_text:
+                hint = " (check user/password/key)"
+            raise RuntimeError(f"Cannot open SSH connection to {target}: {err_text or rc}{hint}")
+
+    def close(self):
+        with self._lock:
+            procs = list(self._procs)
+        for p in procs:
+            _kill(p)
+        if self.remote and self.master_open:
+            subprocess.run(['ssh', '-o', f'ControlPath={self.control_dir}/%C', '-O', 'exit',
+                            f"{self.config.ssh_user}@{self.config.ssh_host}"],
+                           capture_output=True, timeout=10)
+            self.master_open = False
+        if self.control_dir:
+            shutil.rmtree(self.control_dir, ignore_errors=True)
+
+    # --- execution ---
+    def wrap(self, cmd: List[str]) -> List[str]:
+        if not self.remote:
+            return cmd
+        return self._ssh_base() + [f"{self.config.ssh_user}@{self.config.ssh_host}", shlex.join(cmd)]
+
+    def run(self, cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
+        logger.debug(f"run (timeout={timeout}s): {_redact(cmd)}")
+        return subprocess.run(self.wrap(cmd), capture_output=True, text=True, encoding='utf-8',
+                              errors='replace', timeout=timeout, env=self.env, stdin=subprocess.DEVNULL)
+
+    def popen(self, cmd: List[str]) -> subprocess.Popen:
+        logger.debug(f"popen: {_redact(cmd)}")
+        proc = subprocess.Popen(self.wrap(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace',
+                                bufsize=1, env=self.env)
+        with self._lock:
+            self._procs.add(proc)
+        return proc
+
+    def forget(self, proc: subprocess.Popen):
+        with self._lock:
+            self._procs.discard(proc)
+
+    # --- kubectl ---
+    def kubectl_exec(self, script: str) -> List[str]:
+        c = self.config
+        cmd = shlex.split(c.kubectl)
+        if c.kube_context:
+            cmd += ['--context', c.kube_context]
+        cmd += ['exec', '-n', c.namespace, c.kafka_pod_selector]
+        if c.kafka_container:
+            cmd += ['-c', c.kafka_container]
+        return cmd + ['--', 'sh', '-c', script]
+
+
+def _redact(cmd: List[str]) -> str:
+    text = ' '.join(cmd)
+    return text if len(text) < 400 else text[:400] + '...'
+
+
+def _kill(proc: subprocess.Popen):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# --------------------------------------------------------------------------------------
+# In-pod shell snippets
+# --------------------------------------------------------------------------------------
+
+def pod_preamble(config: TraceConfig) -> str:
+    extra = "/opt/kafka/bin:/opt/bitnami/kafka/bin:/usr/local/kafka/bin:/opt/confluent/bin"
+    path = f'{shlex.quote(config.kafka_bin_dir)}:"$PATH":{extra}' if config.kafka_bin_dir else f'"$PATH":{extra}'
+    jvm_opts = "-XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:+ExitOnOutOfMemoryError -Djava.awt.headless=true"
+    return "\n".join([
+        f"export PATH={path}",
+        'kt_bin() { for n in "$1.sh" "$1"; do if command -v "$n" >/dev/null 2>&1; then echo "$n"; return 0; fi; done; return 127; }',
+        # Tool JVMs must not bind the broker's JMX port nor load its javaagents (jmx exporter ports, extra memory)
+        "export JMX_PORT=",
+        'if [ -n "$KAFKA_OPTS" ]; then KAFKA_OPTS=$(printf "%s" "$KAFKA_OPTS" | sed "s/-javaagent:[^ ]*//g"); export KAFKA_OPTS; fi',
+        f"export KAFKA_HEAP_OPTS={shlex.quote('-Xms32m -Xmx' + config.tool_heap)}",
+        f"export KAFKA_JVM_PERFORMANCE_OPTS={shlex.quote(jvm_opts)}",
+        'KT_NICE=; if command -v nice >/dev/null 2>&1; then KT_NICE="nice -n 10"; fi',
+    ])
+
+
+PROBE_SCRIPT = r'''
+echo "KTPROBE|get_offsets|$(kt_bin kafka-get-offsets)"
+echo "KTPROBE|consumer|$(kt_bin kafka-console-consumer)"
+echo "KTPROBE|topics|$(kt_bin kafka-topics)"
+echo "KTPROBE|run_class|$(kt_bin kafka-run-class)"
+echo "KTPROBE|grep|$(command -v grep)"
+if [ "$(KT_T=AB awk 'BEGIN{print tolower(ENVIRON["KT_T"])}' 2>/dev/null)" = ab ]; then echo "KTPROBE|awk|yes"; fi
+if timeout 2 true >/dev/null 2>&1; then echo "KTPROBE|timeout|yes"; fi
+if [ -r /sys/fs/cgroup/memory.max ]; then
+  echo "KTPROBE|mem_limit|$(cat /sys/fs/cgroup/memory.max)"
+  echo "KTPROBE|mem_used|$(cat /sys/fs/cgroup/memory.current)"
+  echo "KTPROBE|mem_inactive_file|$(awk '$1 == "inactive_file" {print $2}' /sys/fs/cgroup/memory.stat 2>/dev/null)"
+elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+  echo "KTPROBE|mem_limit|$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+  echo "KTPROBE|mem_used|$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes)"
+  echo "KTPROBE|mem_inactive_file|$(awk '$1 == "total_inactive_file" {print $2}' /sys/fs/cgroup/memory/memory.stat 2>/dev/null)"
+fi
+for f in /proc/[0-9]*/cmdline; do
+  [ "$f" = "/proc/$$/cmdline" ] && continue
+  if tr '\000' ' ' < "$f" 2>/dev/null | grep -q 'kafka[.]Kafka '; then echo "KTPROBE|broker|yes"; break; fi
+done
+'''
+
+
+# --------------------------------------------------------------------------------------
+# Search terms and record parsing
+# --------------------------------------------------------------------------------------
+
+def build_search_terms(device_id: str, extra: List[str]) -> List[str]:
+    """Device id plus the spellings other services commonly use for the same id."""
+    terms = [device_id]
+    if HEX32_RE.match(device_id):
+        d = device_id.lower()
+        terms.append(f"{d[:8]}-{d[8:12]}-{d[12:16]}-{d[16:20]}-{d[20:]}")
+    elif UUID_RE.match(device_id):
+        terms.append(device_id.replace('-', ''))
+    terms += extra
+    out = []
+    for t in terms:
+        for v in (t, t.replace('/', '\\/')):  # JSON encoders may escape '/'
+            if v and v.lower() not in {o.lower() for o in out}:
+                out.append(v)
+    return out
+
+
+def parse_record(line: str, partition_hint: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Parse '<TsType>:<ts>|KT|Partition:p|KT|Offset:o|KT|<headers>|KT|<key>|KT|<value>'.
+    Columns unsupported by older Kafka CLIs are simply absent."""
+    parts = line.split(FIELD_SEP)
+    m = TS_RE.match(parts[0])
+    if not m and parts[0] != 'NO_TIMESTAMP':
+        return None
+    rec = {'ts_type': m.group(1) if m else None, 'ts': int(m.group(2)) if m else None,
+           'partition': partition_hint, 'offset': None, 'headers': None, 'key': None}
+    i = 1
+    if i < len(parts) and parts[i].startswith('Partition:') and parts[i][10:].isdigit():
+        rec['partition'] = int(parts[i][10:])
+        i += 1
+    if i < len(parts) and parts[i].startswith('Offset:') and parts[i][7:].isdigit():
+        rec['offset'] = int(parts[i][7:])
+        i += 1
+    rest = parts[i:]
+    if len(rest) >= 3:
+        rec['headers'], rec['key'], rec['value'] = rest[0], rest[1], FIELD_SEP.join(rest[2:])
+    elif len(rest) == 2:
+        rec['key'], rec['value'] = rest
+    else:
+        rec['value'] = rest[0] if rest else ''
+    return rec
+
+
+def _extract_event_type(data: Any) -> str:
+    if not isinstance(data, dict):
+        return 'unknown'
+    for key in ('event_type', 'action_type', 'eventType', 'actionType', 'type', 'action', 'operation', 'method'):
+        value = data.get(key)
+        if value and isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    if 'message' in data:
+        return 'log_message'
+    if 'error' in data or 'exception' in data:
+        return 'error'
+    return 'unknown'
+
+
+# --------------------------------------------------------------------------------------
+# Tracer
+# --------------------------------------------------------------------------------------
+
+class KomniTracer:
+    """Plans and executes a bounded, window-scoped scan of the cluster"""
+
+    def __init__(self, config: TraceConfig):
+        self.config = config
+        self.transport = Transport(config)
+        self.events: List[KafkaEvent] = []
+        self.results: List[PartitionResult] = []
+        self.caps: Dict[str, str] = {}
+        self.terms = build_search_terms(config.device_id, config.extra_terms)
+        self._terms_lower = [t.lower() for t in self.terms]
+        self._stop = threading.Event()
+        self.window_start, self.window_end = self._window()
+        os.makedirs(config.output_dir, exist_ok=True)
 
     def __enter__(self):
+        self.transport.open()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
 
     def cleanup(self):
-        """Clean up temporary resources and SSH connections"""
-        # Clean up SSH control connections
-        if self.config.ssh_host:
-            try:
-                # Close any persistent SSH connections
-                control_path = f"~/.ssh/control-{self.config.ssh_user}@{self.config.ssh_host}:22"
-                subprocess.run(["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", 
-                               f"{self.config.ssh_user}@{self.config.ssh_host}"], 
-                              capture_output=True, timeout=5)
-                logger.debug("Closed SSH control connections")
-            except Exception as e:
-                logger.debug(f"Error closing SSH connections: {e}")
-        
-        # Clean up temporary directory
-        if self.temp_dir and os.path.exists(self.temp_dir):
-            try:
-                shutil.rmtree(self.temp_dir)
-                logger.info(f"Successfully cleaned up temporary directory: {self.temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up temporary directory {self.temp_dir}: {e}")
-    
-    def discover_kafka_topics(self) -> List[str]:
-        """Discover available Kafka topics in the namespace"""
-        try:
-            logger.info("Starting Kafka topic discovery...")
-            cmd = [
-                "kubectl", "exec", "-n", self.config.namespace,
-                self.config.kafka_pod_selector
-            ]
-            if self.config.kafka_container:
-                cmd.extend(["-c", self.config.kafka_container])
-            cmd.extend([
-                "--", "env", "JMX_PORT=", "kafka-topics.sh",
-                "--bootstrap-server", self.config.kafka_broker, "--list"
-            ])
-            
-            logger.info("Executing topic discovery command...")
-            # Increased timeout for topic discovery in slower networks
-            result = _execute_remote_command(self.config, cmd, timeout=45)
-            
-            if result.returncode != 0:
-                logger.error(f"Failed to list Kafka topics (return code: {result.returncode})")
-                logger.error(f"STDOUT: {result.stdout.strip()}")
-                logger.error(f"STDERR: {result.stderr.strip()}")
-                return []
-            
-            topics = [topic.strip() for topic in result.stdout.split('\n') 
-                     if topic.strip() and not topic.strip().startswith('__')]
-            
-            if self.config.topic_filter:
-                topics = [t for t in topics if self.config.topic_filter in t]
-                logger.info(f"Applied topic filter '{self.config.topic_filter}': {len(topics)} topics match.")
-            
-            logger.info(f"Discovered {len(topics)} Kafka topics to process: {topics[:5]}{'...' if len(topics) > 5 else ''}")
-            return topics
-            
-        except subprocess.TimeoutExpired:
-            logger.error("Topic discovery timed out after 30 seconds")
-            return []
-        except Exception as e:
-            logger.error(f"Error discovering Kafka topics: {e}", exc_info=True)
-            return []
-    
-    def run_trace(self) -> List[KafkaEvent]:
-        """Execute the main tracing process using parallel processes."""
-        logger.info("Starting Kafka event trace")
-        
-        # Use explicit topic list if provided, otherwise discover topics
-        if self.config.topic_list:
-            topics = self.config.topic_list
-            logger.info(f"Using provided topic list: {topics}")
+        self._stop.set()
+        self.transport.close()
+
+    def _window(self) -> Tuple[Optional[datetime], Optional[datetime]]:
+        start = self.config.since
+        if start is None and self.config.max_age_hours > 0:
+            start = datetime.now() - timedelta(hours=self.config.max_age_hours)
+        return start, self.config.until
+
+    def _exec(self, script: str, timeout: int) -> subprocess.CompletedProcess:
+        full = pod_preamble(self.config) + "\n" + script
+        return self.transport.run(self.transport.kubectl_exec(full), timeout=timeout)
+
+    # --- capability probe & safety ---
+    def probe(self):
+        result = self._exec(PROBE_SCRIPT, timeout=60)
+        for line in result.stdout.splitlines():
+            if line.startswith('KTPROBE|'):
+                _, k, v = (line.split('|', 2) + [''])[:3]
+                self.caps[k] = v.strip()
+        if not self.caps:
+            raise RuntimeError(f"kubectl exec into {self.config.kafka_pod_selector} failed: "
+                               f"{result.stderr.strip()[-800:]}")
+        logger.info("Pod capabilities: " + ", ".join(f"{k}={v or '-'}" for k, v in sorted(self.caps.items())
+                                                     if not k.startswith('mem_')))
+        if not self.caps.get('consumer'):
+            raise RuntimeError("kafka-console-consumer not found in the pod (use --kafka-bin-dir or another --kafka-pod)")
+        if self.config.remote_filter and not self.caps.get('grep'):
+            logger.warning("grep not available in the pod: filtering client-side (all records cross the wire)")
+            self.config.remote_filter = False
+
+    def safe_parallelism(self, requested: int) -> int:
+        c = self.config
+        parallel = max(1, requested)
+        reasons = []
+        if self.transport.remote and parallel > SSH_MAX_SESSIONS:
+            parallel = SSH_MAX_SESSIONS
+            reasons.append(f"sshd MaxSessions (multiplexed) -> {SSH_MAX_SESSIONS}")
+        if self.caps.get('broker') == 'yes':
+            logger.warning(f"{c.kafka_pod_selector} is a running Kafka BROKER: tool JVMs share its memory cgroup. "
+                           "Prefer --kafka-pod pointing to a Kafka client/toolbox pod.")
+            if parallel > 2 and not c.unsafe:
+                parallel = 2
+                reasons.append("target is a broker pod -> 2 (override with --unsafe)")
+        limit, used = _to_int(self.caps.get('mem_limit')), _to_int(self.caps.get('mem_used'))
+        if used is not None:
+            # Working set like kubelet's eviction/OOM accounting: reclaimable page cache does not count
+            used -= _to_int(self.caps.get('mem_inactive_file')) or 0
+        if limit and used is not None and limit < (1 << 50):
+            per_jvm = (_mem_to_mb(c.tool_heap) + JVM_OVERHEAD_MB) * 1024 * 1024
+            headroom = limit - used
+            allowed = int((headroom * 0.5) // per_jvm)
+            logger.info(f"Pod memory: limit={limit >> 20}MiB working_set={used >> 20}MiB headroom={headroom >> 20}MiB, "
+                        f"~{per_jvm >> 20}MiB per tool JVM")
+            if allowed < 1 and not c.unsafe:
+                raise RuntimeError(
+                    f"Pod has only {headroom >> 20}MiB memory headroom; launching a tool JVM risks an OOMKill of "
+                    f"{c.kafka_pod_selector}. Use a client pod (--kafka-pod), a smaller --tool-heap, or --unsafe.")
+            if allowed < parallel and not c.unsafe:
+                parallel = max(1, allowed)
+                reasons.append(f"memory headroom -> {parallel}")
+        if reasons:
+            logger.warning(f"Parallelism reduced from {requested} to {parallel}: " + "; ".join(reasons))
+        return parallel
+
+    # --- offsets ---
+    def _offset_cmd_args(self, legacy_flag: bool) -> List[str]:
+        c = self.config
+        args = ['--broker-list' if legacy_flag else '--bootstrap-server', c.kafka_broker]
+        if c.kafka_client_config:
+            args += ['--command-config', c.kafka_client_config]
+        return args
+
+    def fetch_offsets(self, topics_regex: Optional[str]) -> Dict[str, Dict[str, Dict[int, Optional[int]]]]:
+        """Returns {label: {topic: {partition: offset}}} for labels earliest/latest/since/until"""
+        specs = [('earliest', '-2'), ('latest', '-1')]
+        if self.window_start:
+            specs.append(('since', str(int(self.window_start.timestamp() * 1000))))
+        if self.window_end:
+            specs.append(('until', str(int(self.window_end.timestamp() * 1000))))
+        if self.caps.get('get_offsets'):
+            for legacy in (False, True):
+                out = self._fetch_offsets_modern(specs, topics_regex, legacy)
+                if out is not None:
+                    return out
+            raise RuntimeError("kafka-get-offsets failed (see log)")
+        if self.caps.get('run_class') and self.caps.get('topics'):
+            return self._fetch_offsets_legacy(specs, topics_regex)
+        raise RuntimeError("Neither kafka-get-offsets nor kafka-run-class/kafka-topics are available in the pod")
+
+    def _fetch_offsets_modern(self, specs, topics_regex, legacy_flag):
+        base = ' '.join(shlex.quote(a) for a in self._offset_cmd_args(legacy_flag))
+        topic_arg = f"--topic {shlex.quote(topics_regex)}" if topics_regex else "--exclude-internal-topics"
+        lines = ['GO=$(kt_bin kafka-get-offsets)']
+        for label, t in specs:
+            lines.append(f'echo "{MARK}{label}"; $KT_NICE "$GO" {base} {topic_arg} --time {t} || exit $?')
+        result = self._exec("\n".join(lines), timeout=300)
+        if result.returncode != 0:
+            logger.debug(f"kafka-get-offsets rc={result.returncode}: {result.stderr.strip()[-1500:]}")
+            if not legacy_flag and 'recognized option' in result.stderr:
+                return None
+            logger.error(f"kafka-get-offsets failed: {result.stderr.strip()[-800:]}")
+            return None
+        return _parse_offsets(result.stdout)
+
+    def _fetch_offsets_legacy(self, specs, topics_regex):
+        c = self.config
+        list_args = ['--bootstrap-server', c.kafka_broker, '--list']
+        if c.kafka_client_config:
+            list_args += ['--command-config', c.kafka_client_config]
+        res = self._exec('$KT_NICE "$(kt_bin kafka-topics)" ' + ' '.join(shlex.quote(a) for a in list_args), 120)
+        topics = [t.strip() for t in res.stdout.splitlines() if t.strip() and not t.startswith('_')]
+        if topics_regex:
+            rx = re.compile(topics_regex)
+            topics = [t for t in topics if rx.fullmatch(t)]
+        base = ' '.join(shlex.quote(a) for a in self._offset_cmd_args(True))
+        lines = ['RC=$(kt_bin kafka-run-class)']
+        for label, t in specs:
+            lines.append(f'echo "{MARK}{label}"')
+            for topic in topics:
+                lines.append(f'$KT_NICE "$RC" kafka.tools.GetOffsetShell {base} --topic {shlex.quote(topic)} --time {t}')
+        result = self._exec("\n".join(lines), timeout=120 + 10 * len(topics) * len(specs))
+        return _parse_offsets(result.stdout)
+
+    # --- planning ---
+    def select_topics(self, latest: Dict[str, Dict[int, Optional[int]]]) -> List[str]:
+        c = self.config
+        topics = sorted(latest)
+        if c.topic_list:
+            missing = [t for t in c.topic_list if t not in latest]
+            if missing:
+                logger.warning(f"Requested topics not found in cluster: {missing}")
+            topics = [t for t in c.topic_list if t in latest]
+        if c.topic_filter:
+            topics = [t for t in topics if c.topic_filter in t]
+        if c.topic_regex:
+            topics = [t for t in topics if re.search(c.topic_regex, t)]
+        if c.exclude_regex and not c.topic_list:
+            topics = [t for t in topics if not re.search(c.exclude_regex, t)]
+        return topics
+
+    def build_plan(self, offsets, topics: List[str]) -> List[PartitionTask]:
+        c = self.config
+        tasks = []
+        for topic in topics:
+            for p, latest in sorted(offsets['latest'].get(topic, {}).items()):
+                if latest is None or latest <= 0:
+                    continue
+                earliest = offsets['earliest'].get(topic, {}).get(p) or 0
+                start, end = earliest, latest
+                retention_hit = False
+                if 'since' in offsets:
+                    s = offsets['since'].get(topic, {}).get(p)
+                    if s is None or s < 0:  # no record at/after window start
+                        continue
+                    start = max(s, earliest)
+                    retention_hit = earliest > 0 and s <= earliest
+                if 'until' in offsets:
+                    u = offsets['until'].get(topic, {}).get(p)
+                    if u is not None and u >= 0:
+                        end = min(u, latest)
+                if end <= start:
+                    continue
+                capped = False
+                if c.max_messages and end - start > c.max_messages:
+                    start, capped = end - c.max_messages, True
+                tasks.append(PartitionTask(topic, p, earliest, latest, start, end, capped, retention_hit))
+        return tasks
+
+    def log_plan(self, topics: List[str], tasks: List[PartitionTask]):
+        per_topic: Dict[str, List[PartitionTask]] = {}
+        for t in tasks:
+            per_topic.setdefault(t.topic, []).append(t)
+        total = sum(t.expected for t in tasks)
+        w0 = self.window_start.isoformat(sep=' ', timespec='seconds') if self.window_start else 'beginning'
+        w1 = self.window_end.isoformat(sep=' ', timespec='seconds') if self.window_end else 'now'
+        logger.info(f"Window: {w0} -> {w1}; search terms: {self.terms}")
+        logger.info(f"Plan: {len(per_topic)}/{len(topics)} topics with data in window, "
+                    f"{len(tasks)} partitions, {total:,} messages to scan")
+        for topic, ts in sorted(per_topic.items(), key=lambda kv: -sum(t.expected for t in kv[1])):
+            flags = []
+            if any(t.capped for t in ts):
+                flags.append("CAPPED by --max-messages")
+            if any(t.retention_hit for t in ts):
+                flags.append("window older than retention (oldest data already deleted)")
+            logger.info(f"  {topic}: {len(ts)} partitions, {sum(t.expected for t in ts):,} msgs"
+                        + (f"  [{'; '.join(flags)}]" if flags else ""))
+
+    # --- execution ---
+    def _units(self, tasks: List[PartitionTask]) -> List[List[PartitionTask]]:
+        per_topic: Dict[str, List[PartitionTask]] = {}
+        for t in tasks:
+            per_topic.setdefault(t.topic, []).append(t)
+        units = []
+        n = max(1, self.config.partitions_per_exec)
+        for ts in per_topic.values():
+            for i in range(0, len(ts), n):
+                units.append(ts[i:i + n])
+        # Longest first: better wall time with a bounded worker pool
+        units.sort(key=lambda u: -sum(t.expected for t in u))
+        return units
+
+    def _unit_script(self, unit: List[PartitionTask]) -> str:
+        c = self.config
+        topic = unit[0].topic
+        consumer_args = [
+            '--bootstrap-server', c.kafka_broker, '--topic', topic,
+            '--timeout-ms', str(c.consumer_inactivity_timeout * 1000),
+            '--consumer-property', f'client.id={c.client_id}',
+            '--consumer-property', 'enable.auto.commit=false',
+            '--consumer-property', 'max.partition.fetch.bytes=1048576',
+            '--consumer-property', 'fetch.max.bytes=8388608',
+            '--property', 'print.timestamp=true', '--property', 'print.partition=true',
+            '--property', 'print.offset=true', '--property', 'print.headers=true',
+            '--property', 'print.key=true', '--property', f'key.separator={FIELD_SEP}',
+        ]
+        if c.kafka_client_config:
+            consumer_args += ['--consumer.config', c.kafka_client_config]
+        args = ' '.join(shlex.quote(a) for a in consumer_args)
+        specs = ' '.join(f"{t.partition}:{t.start}:{t.expected}" for t in unit)
+        timeout = f"timeout {c.partition_timeout}" if self.caps.get('timeout') else ""
+        prelude = ""
+        if c.remote_filter and self.caps.get('awk'):
+            prelude = f"export KT_TERMS={shlex.quote(chr(10).join(self.terms))}\n"
+            sink = AWK_FILTER.strip()
+        elif c.remote_filter:
+            greps = ' '.join(f"-e {shlex.quote(t)}" for t in self.terms + [MARK])
+            sink = f"grep -F -i {greps}"
         else:
-            topics = self.discover_kafka_topics()
-            if not topics:
-                logger.error("No Kafka topics found to process.")
-                return []
-        
-        logger.info(f"Processing {len(topics)} topics with max {self.config.max_parallel_topics} parallel processes")
-        
-        if self.config.max_parallel_topics > 8:
-            logger.warning("More than 8 will cause ssh connection issues, consider reducing this value.")
-            
-        
-        all_events = []
-        with ProcessPoolExecutor(max_workers=self.config.max_parallel_topics) as executor:
-            future_to_topic = {
-                executor.submit(consume_topic_process, topic, self.config, self.temp_dir): topic
-                for topic in topics
-            }
-            
-            for future in as_completed(future_to_topic):
-                topic = future_to_topic[future]
-                try:
-                    result_file = future.result()
-                    events = self._load_events_from_file(result_file)
-                    all_events.extend(events)
-                    logger.info(f"Collected {len(events)} events from topic {topic}")
-                except Exception as e:
-                    logger.error(f"Error processing result from topic {topic}: {e}")
-        
-        all_events.sort(key=lambda e: e.timestamp)
-        self.events = all_events
-        
-        logger.info(f"Total events collected: {len(all_events)}")
-        return all_events
-    
-    def _load_events_from_file(self, file_path: str) -> List[KafkaEvent]:
-        """Load events from a JSON file created by a worker process"""
+            sink = "cat"
+        return prelude + f'''C=$(kt_bin kafka-console-consumer) || {{ echo "{MARK}fatal|consumer not found" >&2; exit 127; }}
+{{
+for spec in {specs}; do
+  p=${{spec%%:*}}; r=${{spec#*:}}; o=${{r%%:*}}; n=${{r#*:}}
+  echo "{MARK}start|$p" >&2; echo "{MARK}p|$p"
+  {timeout} $KT_NICE "$C" {args} --partition "$p" --offset "$o" --max-messages "$n"
+  echo "{MARK}end|$p|$?" >&2
+done
+}} | {sink}
+exit 0'''
+
+    def _run_unit(self, unit: List[PartitionTask]) -> Tuple[List[Dict[str, Any]], List[PartitionResult]]:
+        c = self.config
+        results = {t.partition: PartitionResult(t.topic, t.partition, t.earliest, t.latest, t.start, t.end,
+                                                t.expected, capped=t.capped, retention_hit=t.retention_hit)
+                   for t in unit}
+        events: List[Dict[str, Any]] = []
+        if self._stop.is_set():
+            return events, list(results.values())
+        cmd = self.transport.kubectl_exec(pod_preamble(c) + "\n" + self._unit_script(unit))
+        proc = self.transport.popen(cmd)
+        errors: Dict[int, List[str]] = {}
+        stderr_tail: List[str] = []
+
+        def read_stderr():
+            current = None
+            for line in proc.stderr:
+                line = line.rstrip('\n')
+                if line.startswith(MARK):
+                    f = line[len(MARK):].split('|')
+                    if f[0] == 'start' and f[1].isdigit():
+                        current = int(f[1])
+                        results[current].status = 'running'
+                    elif f[0] == 'end' and len(f) > 2 and f[1].isdigit():
+                        results[int(f[1])].rc = int(f[2]) if f[2].lstrip('-').isdigit() else None
+                    continue
+                m = PROCESSED_RE.search(line)
+                if m and current is not None:
+                    results[current].consumed = int(m.group(1))
+                elif line.strip():
+                    if current is not None and ('ERROR' in line or 'Exception' in line):
+                        errors.setdefault(current, []).append(line.strip())
+                    stderr_tail.append(line)
+                    del stderr_tail[:-20]
+
+        t_err = threading.Thread(target=read_stderr, daemon=True)
+        t_err.start()
+        deadline = c.partition_timeout * len(unit) + 120
+        watchdog = threading.Timer(deadline, lambda: _kill(proc))
+        watchdog.start()
+        current_partition = None
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                events_data = JSON_LOADS(f.read())
-            
-            return [KafkaEvent(
-                timestamp=datetime.fromisoformat(e['timestamp']),
-                topic=e['topic'], device_id=e['device_id'],
-                event_type=e['event_type'], message=e['message'],
-                raw_data=e['raw_data'], partition=e.get('partition'),
-                offset=e.get('offset')
-            ) for e in events_data]
-        except Exception as e:
-            logger.error(f"Error loading events from {file_path}: {e}")
+            for line in proc.stdout:
+                if self._stop.is_set():
+                    _kill(proc)
+                    break
+                line = line.rstrip('\n')
+                if line.startswith(MARK):
+                    f = line[len(MARK):].split('|')
+                    if f[0] == 'p' and f[1].isdigit():
+                        current_partition = int(f[1])
+                    elif f[0] == 'last' and f[1].isdigit() and f[2].isdigit() and int(f[1]) in results:
+                        results[int(f[1])].last_offset = int(f[2])
+                    continue
+                if not line:
+                    continue
+                if not c.remote_filter and current_partition in results:
+                    m = OFFSET_COL_RE.search(line)
+                    if m:
+                        results[current_partition].last_offset = int(m.group(1))
+                low = line.lower()
+                if not any(t in low for t in self._terms_lower):
+                    continue
+                rec = parse_record(line, current_partition)
+                if rec is None:
+                    logger.debug(f"Unparseable matching line (multi-line value?): {line[:200]}")
+                    continue
+                ev = self._to_event(unit[0].topic, rec)
+                if ev is not None:
+                    events.append(ev)
+                    if rec['partition'] in results:
+                        results[rec['partition']].matches += 1
+            proc.wait()
+        finally:
+            watchdog.cancel()
+            _kill(proc)
+            t_err.join(timeout=5)
+            self.transport.forget(proc)
+
+        for r in results.values():
+            errs = errors.get(r.partition, [])
+            timed_out = any('TimeoutException' in e for e in errs)
+            if r.status == 'not_run':
+                r.note = (stderr_tail[-1] if stderr_tail else 'not started')[:300]
+                if self._stop.is_set():
+                    r.status, r.note = 'cancelled', ''
+            elif r.consumed is not None and r.consumed >= r.expected:
+                r.status = 'complete'
+            elif r.last_offset is not None and r.last_offset >= r.end - 1 - TRAILING_MARKER_TOLERANCE:
+                # Offsets never delivered as records: compaction holes or transaction control markers
+                # (a transactional partition usually ends with a commit marker)
+                r.status = 'complete'
+                r.note = f'{r.expected - (r.consumed or 0)} offsets were gaps (compaction / transaction markers)'
+            elif r.rc == 124:
+                r.status, r.note = 'hard_timeout', f'killed after --partition-timeout {c.partition_timeout}s'
+            elif r.consumed is not None and timed_out:
+                r.status = 'incomplete'
+                reached = f', stopped at offset {r.last_offset}' if r.last_offset is not None else ''
+                r.note = (f'no records for {c.consumer_inactivity_timeout}s after {r.consumed}/{r.expected}{reached}: '
+                          'slow broker or offset gaps; raise --timeout')
+            elif r.consumed is not None:
+                r.status = 'incomplete'
+            else:
+                r.status = 'error'
+                r.note = (errs[-1] if errs else (stderr_tail[-1] if stderr_tail else f'rc={r.rc}'))[:300]
+        return events, list(results.values())
+
+    def _to_event(self, topic: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if rec['ts'] is None or rec['ts'] < 0:
+            ts = None
+        else:
+            ts = datetime.fromtimestamp(rec['ts'] / 1000)
+        # CreateTime is producer-supplied and not monotonic: keep the window exact client-side
+        if ts is not None:
+            if self.window_start and ts < self.window_start:
+                return None
+            if self.window_end and ts >= self.window_end:
+                return None
+        value = rec['value']
+        try:
+            data = JSON_LOADS(value)
+        except (JSON_DECODE_ERROR, ValueError, TypeError):
+            data = {"raw_message": value}
+        if not isinstance(data, dict):
+            data = {"value": data}
+        key = None if rec['key'] in (None, 'null') else rec['key']
+        headers = None if rec['headers'] in (None, 'NO_HEADERS') else rec['headers']
+        return {
+            "timestamp": (ts or datetime.fromtimestamp(0)).isoformat(), "topic": topic,
+            "device_id": self.config.device_id, "event_type": _extract_event_type(data),
+            "message": value, "raw_data": data, "partition": rec['partition'], "offset": rec['offset'],
+            "key": key, "headers": headers,
+        }
+
+    def run_trace(self) -> List[KafkaEvent]:
+        c = self.config
+        self.probe()
+        parallel = self.safe_parallelism(c.max_parallel_topics)
+
+        topics_regex = None
+        if c.topic_list:
+            topics_regex = '(' + '|'.join(re.escape(t) for t in c.topic_list) + ')'
+        logger.info("Resolving offsets for all topics...")
+        t0 = time.time()
+        offsets = self.fetch_offsets(topics_regex)
+        topics = self.select_topics(offsets.get('latest', {}))
+        logger.info(f"Offsets resolved in {time.time() - t0:.1f}s for {len(offsets.get('latest', {}))} topics; "
+                    f"{len(topics)} selected")
+        tasks = self.build_plan(offsets, topics)
+        self.log_plan(topics, tasks)
+        total = sum(t.expected for t in tasks)
+        self._write_json(f"plan_{c.device_id}.json", [asdict(t) for t in tasks])
+        if c.dry_run:
+            logger.info("Dry run: nothing consumed")
             return []
+        if total > c.max_total_messages and not c.assume_yes:
+            raise RuntimeError(
+                f"Plan reads {total:,} messages (> --max-total-messages {c.max_total_messages:,}). Narrow it with "
+                "--max-age/--since/--until/--topics/--topic-regex/--max-messages, or confirm with --yes.")
+        if not tasks:
+            logger.warning("No partitions have data in the requested window")
+            return []
+
+        units = self._units(tasks)
+        logger.info(f"Scanning with {parallel} parallel kubectl exec sessions ({len(units)} work units)")
+        raw_events: List[Dict[str, Any]] = []
+        started = time.time()
+        done_msgs = 0
+        executor = ThreadPoolExecutor(max_workers=parallel)
+        futures = {executor.submit(self._run_unit, u): u for u in units}
+        try:
+            for i, fut in enumerate(as_completed(futures), 1):
+                unit = futures[fut]
+                try:
+                    evs, res = fut.result()
+                except Exception as e:
+                    logger.error(f"Work unit {unit[0].topic} failed: {e}", exc_info=True)
+                    evs, res = [], [PartitionResult(t.topic, t.partition, t.earliest, t.latest, t.start, t.end,
+                                                    t.expected, status='error', note=str(e)[:300]) for t in unit]
+                raw_events.extend(evs)
+                self.results.extend(res)
+                done_msgs += sum(t.expected for t in unit)
+                bad = [r for r in res if r.status != 'complete']
+                logger.info(f"[{i}/{len(units)}] {unit[0].topic} p{unit[0].partition}-{unit[-1].partition}: "
+                            f"{len(evs)} matches, {sum(r.consumed or 0 for r in res):,}/"
+                            f"{sum(r.expected for r in res):,} msgs"
+                            + (f", {len(bad)} partitions NOT complete" if bad else "")
+                            + f" | {done_msgs * 100 // max(total, 1)}% planned msgs, {time.time() - started:.0f}s")
+        except KeyboardInterrupt:
+            logger.warning("Interrupted: stopping workers (in-pod consumers are bounded and exit on their own)")
+            self._stop.set()
+            for f in futures:
+                f.cancel()
+            self.transport.close()
+            raise
+        finally:
+            executor.shutdown(wait=True)
+            self._finish(raw_events, tasks)
+        return self.events
+
+    def _finish(self, raw_events: List[Dict[str, Any]], tasks: List[PartitionTask]):
+        seen_results = {(r.topic, r.partition) for r in self.results}
+        for t in tasks:
+            if (t.topic, t.partition) not in seen_results:
+                self.results.append(PartitionResult(t.topic, t.partition, t.earliest, t.latest, t.start, t.end,
+                                                    t.expected, status='cancelled'))
+        seen, events = set(), []
+        for e in raw_events:
+            k = (e['topic'], e['partition'], e['offset'], e['message'] if e['offset'] is None else None)
+            if k in seen:
+                continue
+            seen.add(k)
+            events.append(KafkaEvent(timestamp=datetime.fromisoformat(e['timestamp']), topic=e['topic'],
+                                     device_id=e['device_id'], event_type=e['event_type'], message=e['message'],
+                                     raw_data=e['raw_data'], partition=e['partition'], offset=e['offset'],
+                                     key=e['key'], headers=e['headers']))
+        events.sort(key=lambda ev: (ev.timestamp, ev.topic, ev.partition or 0, ev.offset or 0))
+        self.events = events
+        self.results.sort(key=lambda r: (r.topic, r.partition))
+        self._write_json(f"coverage_{self.config.device_id}.json", [asdict(r) for r in self.results])
+        self.log_coverage()
+
+    def log_coverage(self):
+        if not self.results:
+            return
+        by_status: Dict[str, int] = {}
+        for r in self.results:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
+        expected = sum(r.expected for r in self.results)
+        consumed = sum(min(r.consumed or 0, r.expected) for r in self.results)
+        logger.info(f"Coverage: {consumed:,}/{expected:,} planned messages read "
+                    f"({consumed * 100 / max(expected, 1):.2f}%), partitions: {by_status}")
+        problems = [r for r in self.results if r.status != 'complete']
+        for r in problems[:30]:
+            logger.warning(f"  GAP {r.topic}[{r.partition}] {r.status}: read {r.consumed or 0}/{r.expected} "
+                           f"(offsets {r.start}-{r.end}) {r.note}")
+        if len(problems) > 30:
+            logger.warning(f"  ... {len(problems) - 30} more, see coverage_{self.config.device_id}.json")
+        retention = sorted({r.topic for r in self.results if r.retention_hit})
+        if retention:
+            logger.warning(f"Retention already deleted part of the window in: {retention}")
+        capped = sorted({r.topic for r in self.results if r.capped})
+        if capped:
+            logger.warning(f"Only the newest --max-messages per partition were read in: {capped}")
+
+    def _write_json(self, name: str, data: Any):
+        path = os.path.join(self.config.output_dir, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+        return path
+
+
+def _parse_offsets(stdout: str) -> Dict[str, Dict[str, Dict[int, Optional[int]]]]:
+    out: Dict[str, Dict[str, Dict[int, Optional[int]]]] = {}
+    label = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith(MARK):
+            label = line[len(MARK):]
+            out.setdefault(label, {})
+            continue
+        m = OFFSET_LINE_RE.match(line)
+        if m and label:
+            off = m.group(3)
+            out[label].setdefault(m.group(1), {})[int(m.group(2))] = int(off) if off not in ('',) else None
+    return out
+
+
+def _to_int(v: Optional[str]) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def _mem_to_mb(v: str) -> int:
+    m = re.fullmatch(r'(\d+)([kKmMgG]?)', v.strip())
+    if not m:
+        return 256
+    n, unit = int(m.group(1)), m.group(2).lower()
+    return {'k': n // 1024, 'm': n, 'g': n * 1024}.get(unit, n // (1024 * 1024))
+
+
+# --------------------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------------------
+
+def event_to_dict(e: KafkaEvent) -> Dict[str, Any]:
+    return {'timestamp': e.timestamp.isoformat(), 'topic': e.topic, 'device_id': e.device_id,
+            'event_type': e.event_type, 'message': e.message, 'raw_data': e.raw_data,
+            'partition': e.partition, 'offset': e.offset, 'key': e.key, 'headers': e.headers}
 
 
 def load_events_from_json(json_file: str) -> List[KafkaEvent]:
-    """Load events from a JSON file and convert them to KafkaEvent objects"""
     try:
         with open(json_file, 'r', encoding='utf-8') as f:
             events_data = JSON_LOADS(f.read())
-        
-        events = []
-        for e in events_data:
-            event = KafkaEvent(
-                timestamp=datetime.fromisoformat(e['timestamp']),
-                topic=e['topic'],
-                device_id=e['device_id'],
-                event_type=e['event_type'],
-                message=e['message'],
-                raw_data=e['raw_data'],
-                partition=e.get('partition'),
-                offset=e.get('offset')
-            )
-            events.append(event)
-        
+        events = [KafkaEvent(timestamp=datetime.fromisoformat(e['timestamp']), topic=e['topic'],
+                             device_id=e['device_id'], event_type=e['event_type'], message=e['message'],
+                             raw_data=e['raw_data'], partition=e.get('partition'), offset=e.get('offset'),
+                             key=e.get('key'), headers=e.get('headers'))
+                  for e in events_data]
         logger.info(f"Loaded {len(events)} events from {json_file}")
         return events
     except Exception as e:
@@ -1298,321 +1137,223 @@ def load_events_from_json(json_file: str) -> List[KafkaEvent]:
         return []
 
 
+def generate_reports(events: List[KafkaEvent], config: TraceConfig) -> str:
+    """Render every visualization plus the HTML report; returns the HTML report path"""
+    if not KomniReportGenerator:
+        logger.error("komni_reports.py could not be imported. Cannot generate reports.")
+        return ""
+    logger.info("Generating visualizations and HTML report...")
+    generator = KomniReportGenerator(events, config)
+    graph_paths = {}
+    for name, fn in (('timeline', generator.generate_timeline_graph),
+                     ('swimlane', generator.generate_timeline_swimlane),
+                     ('flow', generator.generate_event_flow_diagram),
+                     ('compact', generator.generate_compact_timeline)):
+        try:
+            path = fn()
+            if path:
+                graph_paths[name] = path
+                logger.info(f"Generated {name} graph: {path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate {name} graph: {e}")
+    report_path = ""
+    try:
+        report_path = generator.generate_html_report(graph_paths)
+        logger.info(f"Generated HTML report with {len(graph_paths)} visualizations")
+    except Exception as e:
+        logger.error(f"Failed to generate HTML report: {e}")
+    try:
+        plotly_path = generator.generate_plotly_interactive_timeline()
+        if plotly_path:
+            logger.info(f"Generated interactive Plotly timeline: {plotly_path}")
+    except Exception as e:
+        logger.warning(f"Failed to generate interactive Plotly timeline: {e}")
+    return report_path
+
+
 def generate_report_only(json_file: str, device_id: str, output_dir: str = "./trace_output"):
-    """Generate only the report from an existing events JSON file"""
     logger.info(f"Report-only mode: Loading events from {json_file}")
-    
-    # Load events from JSON file
     events = load_events_from_json(json_file)
-    
     if not events:
         logger.error("No events loaded from JSON file")
         return
-    
-    # Create a minimal config for report generation
-    config = TraceConfig(
-        namespace="report-only",
-        device_id=device_id,
-        kafka_broker="localhost:9092",  # Not used in report-only mode
-        output_dir=output_dir
-    )
-    
+    config = TraceConfig(namespace="report-only", device_id=device_id, kafka_broker="", output_dir=output_dir)
     os.makedirs(output_dir, exist_ok=True)
-    
-    logger.info(f"Generating report for {len(events)} events")
-    
-    # Generate report
-    report_path = ""
-    if KomniReportGenerator:
-        logger.info("Generating visualizations and HTML report...")
-        report_generator = KomniReportGenerator(events, config)
-        
-        # Generate all graph types and collect their paths
-        graph_paths = {}
-        
-        try:
-            # Generate timeline graph
-            timeline_path = report_generator.generate_timeline_graph()
-            if timeline_path:
-                graph_paths['timeline'] = timeline_path
-                logger.info(f"Generated timeline graph: {timeline_path}")
-        except Exception as e:
-            logger.warning(f"Failed to generate timeline graph: {e}")
-        
-        try:
-            # Generate swimlane timeline
-            swimlane_path = report_generator.generate_timeline_swimlane()
-            if swimlane_path:
-                graph_paths['swimlane'] = swimlane_path
-                logger.info(f"Generated swimlane timeline: {swimlane_path}")
-        except Exception as e:
-            logger.warning(f"Failed to generate swimlane timeline: {e}")
-        
-        try:
-            # Generate event flow diagram
-            flow_path = report_generator.generate_event_flow_diagram()
-            if flow_path:
-                graph_paths['flow'] = flow_path
-                logger.info(f"Generated flow diagram: {flow_path}")
-        except Exception as e:
-            logger.warning(f"Failed to generate flow diagram: {e}")
-        
-        try:
-            # Generate compact timeline
-            compact_path = report_generator.generate_compact_timeline()
-            if compact_path:
-                graph_paths['compact'] = compact_path
-                logger.info(f"Generated compact timeline: {compact_path}")
-        except Exception as e:
-            logger.warning(f"Failed to generate compact timeline: {e}")
-        
-        # Generate HTML report with all the graph paths
-        try:
-            report_path = report_generator.generate_html_report(graph_paths)
-            logger.info(f"Generated HTML report with {len(graph_paths)} visualizations")
-        except Exception as e:
-            logger.error(f"Failed to generate HTML report: {e}")
-        
-        # Optionally generate interactive Plotly timeline if available
-        try:
-            plotly_path = report_generator.generate_plotly_interactive_timeline()
-            if plotly_path:
-                logger.info(f"Generated interactive Plotly timeline: {plotly_path}")
-        except Exception as e:
-            logger.warning(f"Failed to generate interactive Plotly timeline: {e}")
-    else:
-        logger.error("KomniReportGenerator not available. Cannot generate reports.")
-        return
-    
-    print("\n" + "="*60)
-    print("🎉 Report generation completed successfully!")
-    print(f"📊 Processed {len(events)} events for device {device_id}")
-    print(f"📁 Report saved to: {output_dir}")
+    report_path = generate_reports(events, config)
+    print("\n" + "=" * 60)
+    print(f"Report generation completed: {len(events)} events for device {device_id}")
     if report_path:
-        print(f"  📄 HTML Report: {report_path}")
-    print("="*60)
+        print(f"  HTML Report: {report_path}")
+    print("=" * 60)
+
+
+def _parse_dt(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date/time '{value}' (use ISO, e.g. 2025-09-10T15:00)")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 def main():
-    """Main function to parse arguments and execute the trace"""
     parser = argparse.ArgumentParser(
         description='KomniTrace - Kafka Event Tracer for Kubernetes',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage - trace events for a specific device
-  python KomniTrace.py --namespace my-namespace --device-id "12345"
-  
-  # Process only specific topics (much faster)
-  python KomniTrace.py --namespace my-namespace --device-id "12345" \\
-    --topics as-provision-topic device-events-topic audit-topic
-  
-  # Generate report from existing events JSON file (report-only mode)
-  python KomniTrace.py --report-only --events-json events_12345.json --device-id "12345"
-  
-  # Collect events data only, skip report generation (faster)
-  python KomniTrace.py --namespace my-namespace --device-id "12345" --no-reports
-  
-  # Remote execution via SSH with automatic key setup
-  python KomniTrace.py --namespace my-namespace --device-id "12345" \\
-    --ssh-host "master.k8s.local" --ssh-user "admin" --ssh-password "secret"
-  
-  # Force SSH key regeneration for performance
-  python KomniTrace.py --namespace my-namespace --device-id "12345" \\
-    --ssh-host "master.k8s.local" --ssh-user "admin" --ssh-password "secret" \\
-    --ssh-setup-keys
-  
-  # Use existing SSH key (skip automatic setup)
-  python KomniTrace.py --namespace my-namespace --device-id "12345" \\
-    --ssh-host "master.k8s.local" --ssh-user "admin" \\
-    --ssh-key "~/.ssh/my_key"
-  
-  # Disable automatic SSH key setup (password only)
-  python KomniTrace.py --namespace my-namespace --device-id "12345" \\
-    --ssh-host "master.k8s.local" --ssh-user "admin" --ssh-password "secret" \\
-    --ssh-no-key-setup
+  # Last 8 days (default window), all topics, local kubectl
+  python KomniTrace.py -n my-namespace -d b40754c2bc034c9c9b29ec8e86a0edf7
 
-SSH Performance Features:
-  - Automatic SSH key generation and deployment for faster connections
-  - Persistent SSH connections with connection multiplexing
-  - Optimized SSH settings for maximum throughput
-  - Fallback to password authentication if key setup fails
+  # Remote kubectl through SSH (one multiplexed connection, password works with parallelism)
+  SSHPASS=secret python KomniTrace.py -n my-ns -d 12345 --ssh-host 10.0.0.1 --ssh-user root
+
+  # Exact window, specific topics, also match the account id
+  python KomniTrace.py -n my-ns -d 12345 --since 2025-09-10T08:00 --until 2025-09-10T12:00 \\
+    --topics as-provision-topic device-events-topic --match ACCOUNT-42
+
+  # See what would be read (topics, partitions, message counts) without consuming
+  python KomniTrace.py -n my-ns -d 12345 --dry-run
+
+  # Run the Kafka CLI tools in a client pod instead of a broker (recommended in production)
+  python KomniTrace.py -n my-ns -d 12345 --kafka-pod deploy/kafka-client --kafka-broker kafka:9092
+
+  # Report from an existing events JSON
+  python KomniTrace.py --report-only --events-json trace_output/events_12345.json -d 12345
         """
     )
-    
-    # Report-only mode arguments
-    parser.add_argument('--report-only', action='store_true', 
-                       help='Generate report from existing events JSON file (skips Kafka consumption)')
-    parser.add_argument('--events-json', 
-                       help='Path to existing events JSON file (required for --report-only)')
-    
-    parser.add_argument('--device-id', '-d', required=True, help='Device ID to search for in Kafka events')
-    parser.add_argument('--namespace', '-n', help='Kubernetes namespace where Kafka is running (not required for --report-only)')
-    parser.add_argument('--kafka-broker', '-b', default='kafka:9092', help='Kafka broker address (default: kafka:9092)')
-    parser.add_argument('--max-age', '-a', type=int, default=24 * 8, help='Maximum age of events in hours (default: 192, 0 = all history)')
-    parser.add_argument('--max-parallel', '-p', type=int, default=4, help='Maximum parallel topic consumers')
-    parser.add_argument('--output-dir', '-o', default='./trace_output', help='Output directory for results')
-    parser.add_argument('--timeout', type=int, default=15, help='Consumer inactivity timeout in seconds (default: 15)')
-    parser.add_argument('--max-messages', '-m', type=int, default=None, help='Maximum messages to consume per topic (default: unlimited)')
-    parser.add_argument('--topic-filter', '-f', help='Filter to process only topics containing this string')
-    parser.add_argument('--topics', nargs='+', help='Explicit list of topics to process (space-separated). If provided, skips topic discovery.')
-    
-    parser.add_argument('--ssh-host', help='SSH host for remote execution')
-    parser.add_argument('--ssh-user', help='SSH username')
-    parser.add_argument('--ssh-password', help='SSH password')
-    parser.add_argument('--ssh-key', help='SSH private key file path (alternative to password)')
-    parser.add_argument('--ssh-setup-keys', action='store_true', help='Force SSH key setup even if keys already exist')
-    parser.add_argument('--ssh-no-key-setup', action='store_true', help='Disable automatic SSH key setup (use password only)')
-    parser.add_argument('--ssh-clean-keys', action='store_true', help='Remove existing SSH keys for this host before setup')
-    
-    parser.add_argument('--kafka-pod', default='deployment/kafka', help='Kafka pod selector (default: deployment/kafka)')
-    parser.add_argument('--kafka-container', help='Kafka container name (if multiple containers in pod)')
-    
-    parser.add_argument('--no-graphs', action='store_true', help='Skip graph generation (deprecated, use --no-reports)')
-    parser.add_argument('--no-reports', action='store_true', help='Skip report and graph generation, only save events JSON')
-    parser.add_argument('--skip-offsets', action='store_true', help='Skip offset checking (faster but less precise termination)')
-    
+    g = parser.add_argument_group('mode')
+    g.add_argument('--report-only', action='store_true', help='Generate report from an existing events JSON file')
+    g.add_argument('--events-json', help='Events JSON for --report-only')
+    g.add_argument('--dry-run', action='store_true', help='Resolve offsets and print the scan plan without consuming')
+
+    g = parser.add_argument_group('search')
+    g.add_argument('--device-id', '-d', required=True, help='Device ID to search for (UUID with/without dashes both match)')
+    g.add_argument('--match', action='append', default=[], metavar='TERM',
+                   help='Additional term to match (repeatable): account id, MAC, IP, encrypted id...')
+    g.add_argument('--max-age', '-a', type=int, default=24 * 8, help='Window: last N hours (default 192, 0 = all retained data)')
+    g.add_argument('--since', type=_parse_dt, help='Window start (ISO datetime, overrides --max-age)')
+    g.add_argument('--until', type=_parse_dt, help='Window end (ISO datetime, default now)')
+
+    g = parser.add_argument_group('kafka / kubernetes')
+    g.add_argument('--namespace', '-n', help='Kubernetes namespace where Kafka is running')
+    g.add_argument('--kafka-broker', '-b', default='kafka:9092', help='Bootstrap server as seen from the pod')
+    g.add_argument('--kafka-pod', default='deployment/kafka', help='Pod/deployment where Kafka CLI tools run (prefer a client pod)')
+    g.add_argument('--kafka-container', help='Container name inside --kafka-pod')
+    g.add_argument('--kafka-bin-dir', help='Directory with Kafka CLI scripts inside the pod (auto-detected otherwise)')
+    g.add_argument('--kafka-client-config', help='Client properties file INSIDE the pod (SASL/SSL)')
+    g.add_argument('--kubectl', default='kubectl', help="kubectl command (e.g. 'k3s kubectl', 'oc')")
+    g.add_argument('--context', dest='kube_context', help='kubeconfig context')
+    g.add_argument('--topics', nargs='+', help='Explicit list of topics')
+    g.add_argument('--topic-filter', '-f', help='Only topics containing this string')
+    g.add_argument('--topic-regex', help='Only topics matching this regex')
+    g.add_argument('--exclude-regex', default=r'^_', help="Skip topics matching this regex (default '^_')")
+
+    g = parser.add_argument_group('load and safety')
+    g.add_argument('--max-parallel', '-p', type=int, default=4, help='Concurrent kubectl exec sessions / tool JVMs (default 4)')
+    g.add_argument('--timeout', type=int, default=15, help='Seconds without records before a partition read stops (default 15)')
+    g.add_argument('--partition-timeout', type=int, default=900, help='Hard cap per partition read, enforced in the pod (default 900)')
+    g.add_argument('--max-messages', '-m', type=int, default=None, help='Per partition: read only the newest N messages of the window')
+    g.add_argument('--max-total-messages', type=int, default=20_000_000, help='Refuse plans larger than this unless --yes (default 20M)')
+    g.add_argument('--partitions-per-exec', type=int, default=16, help='Partitions read sequentially per kubectl exec (default 16)')
+    g.add_argument('--tool-heap', default='256m', help='Max heap for Kafka CLI JVMs in the pod (default 256m)')
+    g.add_argument('--client-id', default='komnitrace', help='Kafka client.id (lets operators identify/throttle the scan)')
+    g.add_argument('--no-remote-filter', action='store_true', help='Do not grep inside the pod (stream all records)')
+    g.add_argument('--yes', '-y', action='store_true', help='Accept plans above --max-total-messages')
+    g.add_argument('--unsafe', action='store_true', help='Disable memory/broker parallelism guards')
+    # Accepted so old command lines keep working; offsets are always resolved now
+    g.add_argument('--skip-offsets', action='store_true', help=argparse.SUPPRESS)
+
+    g = parser.add_argument_group('ssh')
+    g.add_argument('--ssh-host', help='Host where kubectl runs')
+    g.add_argument('--ssh-user', help='SSH username')
+    g.add_argument('--ssh-password', help='SSH password (prefer the SSHPASS env var: argv is visible in ps)')
+    g.add_argument('--ssh-key', help='SSH private key file')
+    g.add_argument('--ssh-setup-keys', action='store_true', help='Generate and install a dedicated key on the host')
+    g.add_argument('--ssh-no-key-setup', action='store_true', help='Do not look for/reuse a KomniTrace key')
+    g.add_argument('--ssh-clean-keys', action='store_true', help='Remove the KomniTrace key (and legacy ~/.ssh/config block)')
+    g.add_argument('--ssh-insecure', action='store_true', help='Disable host key checking (lab hosts that get reinstalled)')
+
+    g = parser.add_argument_group('output')
+    g.add_argument('--output-dir', '-o', default='./trace_output', help='Output directory')
+    g.add_argument('--no-reports', '--no-graphs', dest='no_reports', action='store_true', help='Only save events JSON')
+    g.add_argument('--verbose', '-v', action='store_true', help='Debug logging on the console')
+
     args = parser.parse_args()
-    
-    # Validate arguments
+    setup_logging(args.output_dir, args.verbose)
+
     if args.report_only:
-        if not args.events_json:
-            parser.error("--events-json is required when using --report-only")
-        if not os.path.exists(args.events_json):
-            parser.error(f"Events JSON file not found: {args.events_json}")
-        
-        # Run in report-only mode
+        if not args.events_json or not os.path.exists(args.events_json):
+            parser.error("--report-only needs an existing --events-json file")
         generate_report_only(args.events_json, args.device_id, args.output_dir)
         return
-    else:
-        if not args.namespace:
-            parser.error("--namespace is required when not using --report-only")
-    
+    if not args.namespace:
+        parser.error("--namespace is required when not using --report-only")
+    if args.ssh_host and not args.ssh_user:
+        parser.error("--ssh-user is required with --ssh-host")
+
     config = TraceConfig(
-        namespace=args.namespace, device_id=args.device_id,
-        kafka_broker=args.kafka_broker, max_age_hours=args.max_age,
+        namespace=args.namespace, device_id=args.device_id, kafka_broker=args.kafka_broker,
+        max_age_hours=args.max_age, since=args.since, until=args.until,
         max_parallel_topics=args.max_parallel, output_dir=args.output_dir,
-        consumer_inactivity_timeout=args.timeout, topic_filter=args.topic_filter,
-        topic_list=args.topics, max_messages=args.max_messages, ssh_host=args.ssh_host,
-        ssh_user=args.ssh_user, ssh_password=args.ssh_password, ssh_key=args.ssh_key,
-        ssh_setup_keys=args.ssh_setup_keys, ssh_no_key_setup=args.ssh_no_key_setup,
-        ssh_clean_keys=args.ssh_clean_keys, kafka_pod_selector=args.kafka_pod, 
-        kafka_container=args.kafka_container, skip_offset_check=args.skip_offsets
+        consumer_inactivity_timeout=args.timeout, partition_timeout=args.partition_timeout,
+        topic_filter=args.topic_filter, topic_regex=args.topic_regex, exclude_regex=args.exclude_regex or None,
+        topic_list=args.topics, max_messages=args.max_messages, max_total_messages=args.max_total_messages,
+        extra_terms=args.match, remote_filter=not args.no_remote_filter,
+        partitions_per_exec=args.partitions_per_exec,
+        ssh_host=args.ssh_host, ssh_user=args.ssh_user,
+        ssh_password=args.ssh_password or (os.environ.get('SSHPASS') if args.ssh_host else None),
+        ssh_key=args.ssh_key, ssh_setup_keys=args.ssh_setup_keys, ssh_no_key_setup=args.ssh_no_key_setup,
+        ssh_clean_keys=args.ssh_clean_keys, ssh_insecure=args.ssh_insecure,
+        kafka_pod_selector=args.kafka_pod, kafka_container=args.kafka_container,
+        kafka_bin_dir=args.kafka_bin_dir, kafka_client_config=args.kafka_client_config,
+        kubectl=args.kubectl, kube_context=args.kube_context, tool_heap=args.tool_heap,
+        client_id=args.client_id, assume_yes=args.yes, dry_run=args.dry_run, unsafe=args.unsafe,
     )
-    
     logger.info(f"Starting KomniTrace for device_id: {config.device_id}")
-    
+
+    # SIGTERM (e.g. CI cancel) behaves like Ctrl-C so children are cleaned up
+    def _on_sigterm(*_):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    tracer = None
+    interrupted = False
     try:
         with KomniTracer(config) as tracer:
-            events = tracer.run_trace()
-            
-            if not events:
-                logger.warning("No events found for the specified device_id")
-                return
-            
-            logger.info(f"Found {len(events)} events for device {config.device_id}")
-            
-            # --- Report Generation ---
-            report_path = ""
-            # Support both --no-graphs (deprecated) and --no-reports
-            skip_reports = args.no_reports or args.no_graphs
-            
-            if not skip_reports and KomniReportGenerator:
-                logger.info("Generating visualizations and HTML report...")
-                report_generator = KomniReportGenerator(events, config)
-                
-                # Generate all graph types and collect their paths
-                graph_paths = {}
-                
-                try:
-                    # Generate timeline graph
-                    timeline_path = report_generator.generate_timeline_graph()
-                    if timeline_path:
-                        graph_paths['timeline'] = timeline_path
-                        logger.info(f"Generated timeline graph: {timeline_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate timeline graph: {e}")
-                
-                try:
-                    # Generate swimlane timeline
-                    swimlane_path = report_generator.generate_timeline_swimlane()
-                    if swimlane_path:
-                        graph_paths['swimlane'] = swimlane_path
-                        logger.info(f"Generated swimlane timeline: {swimlane_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate swimlane timeline: {e}")
-                
-                try:
-                    # Generate event flow diagram
-                    flow_path = report_generator.generate_event_flow_diagram()
-                    if flow_path:
-                        graph_paths['flow'] = flow_path
-                        logger.info(f"Generated flow diagram: {flow_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate flow diagram: {e}")
-                
-                try:
-                    # Generate compact timeline
-                    compact_path = report_generator.generate_compact_timeline()
-                    if compact_path:
-                        graph_paths['compact'] = compact_path
-                        logger.info(f"Generated compact timeline: {compact_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate compact timeline: {e}")
-                
-                # Generate HTML report with all the graph paths
-                try:
-                    report_path = report_generator.generate_html_report(graph_paths)
-                    logger.info(f"Generated HTML report with {len(graph_paths)} visualizations")
-                except Exception as e:
-                    logger.error(f"Failed to generate HTML report: {e}")
-                
-                # Optionally generate interactive Plotly timeline if available
-                try:
-                    plotly_path = report_generator.generate_plotly_interactive_timeline()
-                    if plotly_path:
-                        logger.info(f"Generated interactive Plotly timeline: {plotly_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate interactive Plotly timeline: {e}")
-            
-            events_file = os.path.join(config.output_dir, f"events_{config.device_id}.json")
-            with open(events_file, 'w', encoding='utf-8') as f:
-                # Convert events to JSON serializable format
-                events_data = []
-                for e in tracer.events:
-                    event_dict = {
-                        'timestamp': e.timestamp.isoformat(),
-                        'topic': e.topic,
-                        'device_id': e.device_id,
-                        'event_type': e.event_type,
-                        'message': e.message,
-                        'raw_data': e.raw_data,
-                        'partition': e.partition,
-                        'offset': e.offset
-                    }
-                    events_data.append(event_dict)
-                
-                import json
-                f.write(json.dumps(events_data, indent=2))
-            
-            logger.info(f"Events saved to: {events_file}")
-            
-            print("\n" + "="*60)
-            print("🎉 KomniTrace completed successfully!")
-            print(f"📊 Found {len(events)} events for device {config.device_id}")
-            print(f"📁 Results saved to: {config.output_dir}")
-            print(f"  📋 Events JSON: {events_file}")
-            if report_path:
-                print(f"  📄 HTML Report: {report_path}")
-            elif skip_reports:
-                print("  📄 HTML Report: Skipped (--no-reports or --no-graphs specified)")
-            print("="*60)
-            
+            tracer.run_trace()
     except KeyboardInterrupt:
-        logger.info("Trace interrupted by user")
-    except Exception as e:
-        logger.error(f"Error during trace execution: {e}", exc_info=True)
-        raise
+        logger.warning("Trace interrupted; partial results (if any) are saved below")
+        interrupted = True
+    except RuntimeError as e:
+        logger.error(str(e))
+        sys.exit(2)
+
+    if config.dry_run or tracer is None:
+        return
+    events = tracer.events
+    events_file = os.path.join(config.output_dir, f"events_{config.device_id}.json")
+    with open(events_file, 'w', encoding='utf-8') as f:
+        json.dump([event_to_dict(e) for e in events], f, indent=2, ensure_ascii=False)
+    logger.info(f"Events saved to: {events_file}")
+    if not events:
+        logger.warning("No events found for the specified device_id")
+        sys.exit(130 if interrupted else 0)
+    report_path = "" if args.no_reports else generate_reports(events, config)
+
+    incomplete = [r for r in tracer.results if r.status != 'complete']
+    print("\n" + "=" * 60)
+    print(f"KomniTrace finished: {len(events)} events for device {config.device_id}")
+    print(f"  Events JSON: {events_file}")
+    print(f"  Coverage:    {os.path.join(config.output_dir, f'coverage_{config.device_id}.json')}")
+    if report_path:
+        print(f"  HTML Report: {report_path}")
+    if incomplete:
+        print(f"  WARNING: {len(incomplete)} partitions were not fully read (see coverage file)")
+    print("=" * 60)
+    if interrupted:
+        sys.exit(130)
+
 
 if __name__ == "__main__":
     main()

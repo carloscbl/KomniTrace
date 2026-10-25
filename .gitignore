@@ -1,0 +1,4 @@
+__pycache__/
+.mypy_cache/
+trace_output/
+komni_trace.log

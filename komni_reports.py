@@ -6,19 +6,18 @@ This module contains all the report generation and visualization functionality
 for the KomniTrace Kafka event tracer.
 
 Features:
-- Timeline graphs with matplotlib
-- Interactive visualizations with Plotly
+- Timeline graphs with matplotlib (optional)
+- Interactive visualizations with Plotly (optional)
 - HTML reports with embedded charts
 - Multiple visualization types (timeline, swimlane, flow, compact)
 """
 
 import os
-import json
+import html
 import logging
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Any
 
 # Optional matplotlib import
 try:
@@ -32,27 +31,10 @@ except ImportError:
 # Optional interactive visualization libraries
 try:
     import plotly.graph_objects as go
-    import plotly.express as px
     from plotly.subplots import make_subplots
-    import plotly.offline as pyo
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
-
-try:
-    import bokeh.plotting as bk
-    from bokeh.models import HoverTool, ColumnDataSource
-    from bokeh.layouts import column, row
-    from bokeh.io import output_file, save
-    BOKEH_AVAILABLE = True
-except ImportError:
-    BOKEH_AVAILABLE = False
-
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -638,7 +620,7 @@ class KomniReportGenerator:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KomniTrace Report - Device {self.config.device_id}</title>
+    <title>KomniTrace Report - Device {html.escape(self.config.device_id)}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -757,7 +739,7 @@ class KomniReportGenerator:
     <div class="container">
         <div class="header">
             <h1>🔍 KomniTrace Event Analysis Report</h1>
-            <h2>Device ID: {self.config.device_id}</h2>
+            <h2>Device ID: {html.escape(self.config.device_id)}</h2>
             <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
         
@@ -811,7 +793,7 @@ class KomniReportGenerator:
         for topic, count in topic_counts.items():
             percentage = (count / len(self.events)) * 100
             topic_short = topic.replace('dp-', '').replace('-topic', '')
-            html_content += f"                        <tr><td>{topic_short}</td><td>{count}</td><td>{percentage:.1f}%</td></tr>\n"
+            html_content += f"                        <tr><td>{html.escape(topic_short)}</td><td>{count}</td><td>{percentage:.1f}%</td></tr>\n"
         
         html_content += """
                     </table>
@@ -823,7 +805,7 @@ class KomniReportGenerator:
         
         for event_type, count in event_type_counts.items():
             percentage = (count / len(self.events)) * 100
-            html_content += f"                        <tr><td>{event_type}</td><td>{count}</td><td>{percentage:.1f}%</td></tr>\n"
+            html_content += f"                        <tr><td>{html.escape(str(event_type))}</td><td>{count}</td><td>{percentage:.1f}%</td></tr>\n"
         
         # Add visualization tabs
         visualizations = [
@@ -874,14 +856,15 @@ class KomniReportGenerator:
         
         for i, event in enumerate(sorted(self.events, key=lambda x: x.timestamp), 1):
             topic_short = event.topic.replace('dp-', '').replace('-topic', '')
-            message_preview = event.message[:100] + "..." if len(event.message) > 100 else event.message
+            # Kafka payloads are untrusted: escape everything rendered into the page
+            message_preview = html.escape(event.message[:100] + "..." if len(event.message) > 100 else event.message)
             timestamp_str = event.timestamp.strftime('%Y-%m-%d %H:%M:%S')
             html_content += f"""
                         <tr>
                             <td>{i}</td>
                             <td>{timestamp_str}</td>
-                            <td>{topic_short}</td>
-                            <td>{event.event_type}</td>
+                            <td>{html.escape(topic_short)}</td>
+                            <td>{html.escape(event.event_type)}</td>
                             <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis;">{message_preview}</td>
                         </tr>
 """
@@ -966,10 +949,10 @@ class KomniReportGenerator:
             hover_text = []
             for event in events_of_type:
                 hover_info = (
-                    f"<b>Event Type:</b> {event.event_type}<br>"
-                    f"<b>Topic:</b> {event.topic}<br>"
+                    f"<b>Event Type:</b> {html.escape(event.event_type)}<br>"
+                    f"<b>Topic:</b> {html.escape(event.topic)}<br>"
                     f"<b>Time:</b> {event.timestamp.strftime('%Y-%m-%d %H:%M:%S')}<br>"
-                    f"<b>Message:</b> {event.message[:100]}..."
+                    f"<b>Message:</b> {html.escape(event.message[:100])}..."
                 )
                 hover_text.append(hover_info)
             
@@ -1062,24 +1045,3 @@ class KomniReportGenerator:
         fig.write_html(plotly_path)
         
         return plotly_path
-    
-    def save_events_to_json(self) -> str:
-        """Save events to a JSON file"""
-        events_file = os.path.join(self.config.output_dir, f"events_{self.config.device_id}.json")
-        with open(events_file, 'w') as f:
-            events_data = []
-            for event in self.events:
-                event_dict = {
-                    'timestamp': event.timestamp.isoformat(),
-                    'topic': event.topic,
-                    'device_id': event.device_id,
-                    'event_type': event.event_type,
-                    'message': event.message,
-                    'raw_data': event.raw_data,
-                    'partition': event.partition,
-                    'offset': event.offset
-                }
-                events_data.append(event_dict)
-            json.dump(events_data, f, indent=2)
-        
-        return events_file
